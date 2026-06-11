@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "runtime": "cloudflare_worker",
+  "entrypoint": "src/index.ts",
+  "assets_dir": "./site",
+  "healthcheck_path": "/api/healthz",
+  "requested_capabilities": {
+    "db": "required",
+    "object_storage": "required",
+    "frontier_ai": "required",
+    "cron": {"schedules": ["0 8 1 * *"]}
+  },
+  "requested_env": [
+    "APP_BASE_URL",
+    "COMPANY_ID",
+    "PM_ENCRYPTION_KEY",
+    "DRCHRONO_CLIENT_ID",
+    "DRCHRONO_CLIENT_SECRET"
+  ]
+}

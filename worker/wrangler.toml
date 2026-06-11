@@ -1,0 +1,21 @@
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+workers_dev = true
+
+# Static assets from site/ are served automatically. Use this for CSS,
+# images, favicons, robots.txt — true static files. HTML pages should be
+# Worker routes in src/index.ts, not files here.
+#
+# Precedence trap: if a file in site/ exact-matches a request path, the
+# static file wins and the matching Worker route never runs. Don't put
+# HTML in site/ for any path you also handle in the Worker.
+[assets]
+directory = "./site"
+
+[vars]
+COMPANY_ID = "01KTPEGN75GB4XY3HHN9JQ591E"
+PUBLIC_SUBDOMAIN = ""
+
+# Enable Workers Logs for runtime observability (console.log, errors, invocations).
+[observability]
+enabled = true

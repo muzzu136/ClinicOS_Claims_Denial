@@ -1,0 +1,32 @@
+-- 0001_initial.sql
+--
+-- The first migration for this app. The Launchyard deploy pipeline applies
+-- this (and any later migrations you add) to your D1 database before your
+-- worker code goes live.
+--
+-- Rules (enforced by the deploy pipeline — violations fail the deploy):
+--
+--   1. Never edit this file once it's been deployed. To change schema,
+--      create a new file `0002_xxx.sql` via `./scripts/new-migration.sh`.
+--   2. No CREATE TABLE / ALTER TABLE / CREATE INDEX / DROP in worker code.
+--      All DDL lives here.
+--   3. DROP TABLE, DROP COLUMN, and ALTER TABLE ... RENAME are allowed
+--      (they warn in the deploy log but don't block). To widen a CHECK
+--      constraint or change a column type, use the SQLite recreate
+--      pattern in one migration: CREATE TABLE x_new, INSERT INTO x_new
+--      SELECT * FROM x, DROP TABLE x, ALTER TABLE x_new RENAME TO x.
+--      Never apply schema changes out-of-band — keep them in a migration
+--      file so the pipeline tracks them.
+--
+-- Add your initial schema below. Multiple statements in one file are fine —
+-- D1 wraps each migration in a transaction, so a partial failure rolls
+-- the whole file back atomically.
+
+-- Example (delete or replace):
+--
+-- CREATE TABLE items (
+--   id INTEGER PRIMARY KEY AUTOINCREMENT,
+--   name TEXT NOT NULL,
+--   created_at INTEGER NOT NULL DEFAULT (unixepoch())
+-- );
+-- CREATE INDEX idx_items_name ON items(name);
