@@ -54,6 +54,49 @@ function generateId(): string {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+function generateReferralCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I/O/0/1 to avoid confusion
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => chars[b % chars.length]).join("");
+}
+
+async function getOrCreateReferralCode(db: D1Database, userId: string): Promise<string> {
+  const row = await db.prepare("SELECT referral_code FROM users WHERE id = ?").bind(userId).first<{ referral_code: string | null }>();
+  if (row?.referral_code) return row.referral_code;
+  // Generate unique code
+  for (let i = 0; i < 10; i++) {
+    const code = generateReferralCode();
+    try {
+      await db.prepare("UPDATE users SET referral_code = ? WHERE id = ?").bind(code, userId).run();
+      return code;
+    } catch { /* collision, retry */ }
+  }
+  throw new Error("Could not generate unique referral code");
+}
+
+async function applyReferralCredit(db: D1Database, referredUserId: string): Promise<void> {
+  const user = await db.prepare("SELECT referred_by FROM users WHERE id = ?").bind(referredUserId).first<{ referred_by: string | null }>();
+  if (!user?.referred_by) return;
+  // Check if credit already applied
+  const existing = await db.prepare("SELECT id FROM referral_credits WHERE referred_user_id = ? AND credited_at IS NOT NULL").bind(referredUserId).first();
+  if (existing) return;
+  const referrerId = user.referred_by;
+  const now = Math.floor(Date.now() / 1000);
+  const thirtyDays = 30 * 24 * 3600;
+  // Create or update the referral credit record
+  let creditRow = await db.prepare("SELECT id FROM referral_credits WHERE referred_user_id = ?").bind(referredUserId).first<{ id: string }>();
+  if (!creditRow) {
+    const creditId = generateId();
+    await db.prepare("INSERT INTO referral_credits (id, referrer_user_id, referred_user_id, created_at, credited_at) VALUES (?, ?, ?, ?, ?)").bind(creditId, referrerId, referredUserId, now, now).run();
+  } else {
+    await db.prepare("UPDATE referral_credits SET credited_at = ? WHERE id = ?").bind(now, creditRow.id).run();
+  }
+  // Extend trial_end for both users (or set from now+30 if not set)
+  await db.prepare(`UPDATE users SET trial_end = CASE WHEN trial_end IS NULL OR trial_end < ? THEN ? + ? ELSE trial_end + ? END WHERE id = ?`).bind(now, now, thirtyDays, thirtyDays, referrerId).run();
+  await db.prepare(`UPDATE users SET trial_end = CASE WHEN trial_end IS NULL OR trial_end < ? THEN ? + ? ELSE trial_end + ? END WHERE id = ?`).bind(now, now, thirtyDays, thirtyDays, referredUserId).run();
+}
+
 async function hashPassword(password: string, salt: string): Promise<string> {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
@@ -80,13 +123,16 @@ type SessionUser = {
   role: string | null;
   account_id: string | null;
   name: string | null;
+  trial_end: number | null;
+  created_at: number | null;
+  onboarding_tour_dismissed: number;
 };
 
 async function getSession(db: D1Database, sessionId: string): Promise<SessionUser | null> {
   if (!sessionId) return null;
   const now = Math.floor(Date.now() / 1000);
   const row = await db.prepare(
-    "SELECT s.user_id, u.email, u.plan, u.role, u.account_id, u.name FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ?"
+    "SELECT s.user_id, u.email, u.plan, u.role, u.account_id, u.name, u.trial_end, u.created_at, COALESCE(u.onboarding_tour_dismissed,0) AS onboarding_tour_dismissed FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ?"
   ).bind(sessionId, now).first<SessionUser>();
   return row ?? null;
 }
@@ -166,6 +212,22 @@ async function hashToken(token: string): Promise<string> {
 
 // ─── Nav builder ──────────────────────────────────────────────────────────────
 
+function buildTrialCountdownBanner(user: SessionUser | null): string {
+  if (!user) return '';
+  // Only show for trial users (no plan or plan is null/empty) with trial_end set and ≤5 days remaining
+  const hasPaidPlan = user.plan && user.plan.toLowerCase() !== '' && user.plan.toLowerCase() !== 'trial';
+  if (hasPaidPlan) return '';
+  if (!user.trial_end) return '';
+  const now = Math.floor(Date.now() / 1000);
+  if (user.trial_end <= now) return ''; // expired
+  const daysLeft = Math.ceil((user.trial_end - now) / 86400);
+  if (daysLeft > 5) return '';
+  const dayWord = daysLeft === 1 ? 'day' : 'days';
+  return `<div style="background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;text-align:center;padding:.6rem 1rem;font-size:.9rem;font-weight:600;z-index:8000;position:relative">
+  <span>&#x23F0; <strong>${daysLeft} ${dayWord}</strong> left in your free trial &mdash; <a href="/pricing" style="color:#fde68a;text-decoration:underline;font-weight:700">upgrade to keep full access</a></span>
+</div>`;
+}
+
 function buildNav(user: SessionUser | null): string {
   const isProUser = isProfessionalPlan(user);
   const teamLink = isProUser ? `<a href="/settings/team">&#x1F465; Team</a> <a href="/settings/rules">&#x1F6E1; Rules</a>` : '';
@@ -183,16 +245,20 @@ function buildNav(user: SessionUser | null): string {
            <a href="/denial-tracker">&#x1F6AB; Denial Tracker</a>
            <a href="/appeal-generator">&#x270D; Appeal Generator</a>
            ${teamLink}
+           <a href="/settings">&#x2699;&#xFE0F; Settings</a>
+           <a href="/settings/referral">&#x1F381; Refer &amp; Earn</a>
            <form method="POST" action="/logout" style="margin:0"><button type="submit" class="nav-dropdown-btn">&#x1F6AA; Sign Out</button></form>
          </div>
        </li>`
     : `<li><a href="/login">Sign In</a></li>`;
-  return `<nav><div class="nav-container">
+  return `${buildTrialCountdownBanner(user)}<nav><div class="nav-container">
   <a href="/" class="logo"><div class="logo-icon">&#x26A1;</div>ClinicOS AI</a>
   <ul class="nav-links">
     <li><a href="/#how-it-works">How it Works</a></li>
     <li><a href="/pricing">Pricing</a></li>
+    <li><a href="/blog">Blog</a></li>
     <li><a href="/#faq">FAQ</a></li>
+    <li><a href="/contact">Contact</a></li>
     <li><a href="/scrubber" class="nav-link-highlight">Claim Scrubber</a></li>
     <li><a href="/denial-tracker" class="nav-link-highlight">Denial Tracker</a></li>
     <li><a href="/eligibility" class="nav-link-highlight">Eligibility</a></li>
@@ -485,35 +551,40 @@ app.post("/api/pm/advancedmd/connect", async (c) => {
 });
 
 // GET /api/pm/drchrono/connect — start DrChrono OAuth flow
+// ACTION REQUIRED: Set DRCHRONO_CLIENT_ID and DRCHRONO_CLIENT_SECRET environment variables
+// in the Cloudflare Workers dashboard before the DrChrono integration will work.
 app.get("/api/pm/drchrono/connect", async (c) => {
   const user = await getCurrentUser(c);
-  if (!user) return c.redirect("/login?next=/scrubber");
+  if (!user) return c.redirect("/login?next=/settings");
   if (!(await userCanConnectPm(c.env.DB, user.user_id))) {
-    return c.redirect("/scrubber?pm_error=upgrade");
+    return c.redirect("/settings?pm_error=upgrade");
   }
   const clientId = c.env.DRCHRONO_CLIENT_ID;
-  if (!clientId) return c.redirect("/scrubber?pm_error=drchrono_not_configured");
-  const redirectUri = `${c.env.APP_BASE_URL}/api/pm/drchrono/callback`;
-  const authUrl = `https://drchrono.com/o/authorize/?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=billing:read`;
+  if (!clientId) return c.redirect("/settings?pm_error=drchrono_not_configured");
+  // Use the canonical /settings/drchrono-callback redirect URI
+  const redirectUri = "https://clinicosal.launchyard.app/settings/drchrono-callback";
+  const authUrl = `https://drchrono.com/o/authorize/?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=patients%3Aread+clinical%3Aread`;
   return c.redirect(authUrl);
 });
 
-// GET /api/pm/drchrono/callback — handle DrChrono OAuth callback
-app.get("/api/pm/drchrono/callback", async (c) => {
+// GET /settings/drchrono-callback — handle DrChrono OAuth callback (redirected from DrChrono)
+// This is the registered OAuth redirect URI: https://clinicosal.launchyard.app/settings/drchrono-callback
+app.get("/settings/drchrono-callback", async (c) => {
   const user = await getCurrentUser(c);
-  if (!user) return c.redirect("/login?next=/scrubber");
+  if (!user) return c.redirect("/login?next=/settings");
   const url = new URL(c.req.url);
   const code = url.searchParams.get("code");
   const error = url.searchParams.get("error");
-  if (error || !code) return c.redirect("/scrubber?pm_error=drchrono_denied");
+  if (error || !code) return c.redirect("/settings?pm_error=drchrono_denied");
   const clientId = c.env.DRCHRONO_CLIENT_ID;
   const clientSecret = c.env.DRCHRONO_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return c.redirect("/scrubber?pm_error=drchrono_not_configured");
+  if (!clientId || !clientSecret) return c.redirect("/settings?pm_error=drchrono_not_configured");
   try {
+    const redirectUri = "https://clinicosal.launchyard.app/settings/drchrono-callback";
     const params = new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      redirect_uri: `${c.env.APP_BASE_URL}/api/pm/drchrono/callback`,
+      redirect_uri: redirectUri,
       client_id: clientId,
       client_secret: clientSecret,
     });
@@ -524,20 +595,42 @@ app.get("/api/pm/drchrono/callback", async (c) => {
     });
     if (!resp.ok) throw new Error("Token exchange failed");
     const data = await resp.json() as { access_token: string; refresh_token: string; expires_in: number };
+    const expiresAt = Math.floor(Date.now() / 1000) + (data.expires_in || 172800);
+
+    // Fetch practice name from DrChrono /api/users/current
+    let practiceName = "";
+    try {
+      const meResp = await fetch("https://app.drchrono.com/api/users/current", {
+        headers: { Authorization: `Bearer ${data.access_token}` },
+      });
+      if (meResp.ok) {
+        const me = await meResp.json() as { practice_group?: { name?: string }; username?: string };
+        practiceName = me?.practice_group?.name || me?.username || "";
+      }
+    } catch { /* non-fatal — store without practice name */ }
+
     const creds = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
-      expires_at: Math.floor(Date.now() / 1000) + (data.expires_in || 172800),
+      expires_at: expiresAt,
+      practice_name: practiceName,
     };
     const encrypted = await encryptCredentials(creds, c.env.PM_ENCRYPTION_KEY);
     const id = generateId();
     await c.env.DB.prepare(
       "INSERT INTO pm_connections (id, user_id, system, credentials_encrypted) VALUES (?, ?, 'drchrono', ?) ON CONFLICT(user_id, system) DO UPDATE SET credentials_encrypted=excluded.credentials_encrypted, connected_at=unixepoch()"
     ).bind(id, user.user_id, encrypted).run();
-    return c.redirect("/scrubber?pm_connected=drchrono");
+    return c.redirect("/settings?pm_connected=drchrono");
   } catch {
-    return c.redirect("/scrubber?pm_error=drchrono_token_failed");
+    return c.redirect("/settings?pm_error=drchrono_token_failed");
   }
+});
+
+// Keep legacy /api/pm/drchrono/callback for backward compat (old registered URIs)
+app.get("/api/pm/drchrono/callback", async (c) => {
+  // Forward all params to the new canonical callback
+  const url = new URL(c.req.url);
+  return c.redirect("/settings/drchrono-callback?" + url.searchParams.toString());
 });
 
 // POST /api/pm/disconnect — disconnect a PM system
@@ -592,15 +685,20 @@ app.post("/api/pm/fetch-claims", async (c) => {
     } else if (system === "drchrono") {
       const clientId = c.env.DRCHRONO_CLIENT_ID;
       const clientSecret = c.env.DRCHRONO_CLIENT_SECRET;
-      if (!clientId || !clientSecret) return c.json({ error: "DrChrono OAuth not configured" }, 500);
-      const result = await fetchDrChronoClaims(creds as { access_token: string; refresh_token: string; expires_at?: number }, startDate, endDate, clientId, clientSecret);
-      claims = result.claims;
-      // Update stored creds if token was refreshed
-      const refreshedCreds = result.newCreds;
-      if ((refreshedCreds as { access_token: string }).access_token !== (creds as { access_token: string }).access_token) {
-        const newEncrypted = await encryptCredentials(refreshedCreds, c.env.PM_ENCRYPTION_KEY);
-        await c.env.DB.prepare("UPDATE pm_connections SET credentials_encrypted = ? WHERE user_id = ? AND system = 'drchrono'")
-          .bind(newEncrypted, user.user_id).run();
+      if (!clientId || !clientSecret) return c.json({ error: "DrChrono integration is not configured. Please contact support.", code: "drchrono_not_configured" }, 500);
+      try {
+        const result = await fetchDrChronoClaims(creds as { access_token: string; refresh_token: string; expires_at?: number }, startDate, endDate, clientId, clientSecret);
+        claims = result.claims;
+        // Update stored creds if token was refreshed
+        const refreshedCreds = result.newCreds;
+        if ((refreshedCreds as { access_token: string }).access_token !== (creds as { access_token: string }).access_token) {
+          const newEncrypted = await encryptCredentials(refreshedCreds, c.env.PM_ENCRYPTION_KEY);
+          await c.env.DB.prepare("UPDATE pm_connections SET credentials_encrypted = ? WHERE user_id = ? AND system = 'drchrono'")
+            .bind(newEncrypted, user.user_id).run();
+        }
+      } catch (refreshErr) {
+        // Token refresh failed — likely revoked; prompt reconnect
+        return c.json({ error: "Your DrChrono session has expired. Please reconnect from Settings.", code: "drchrono_token_expired" }, 401);
       }
     }
   } catch (err) {
@@ -673,9 +771,9 @@ const NAV = buildNav(null); // static fallback (used for pages that don't yet ca
 const FOOTER = `<footer><div class="footer-container">
   <div class="footer-section"><div class="footer-logo"><div class="logo-icon">&#x26A1;</div><strong>ClinicOS AI</strong></div><p class="footer-tagline">AI-powered claim scrubbing for independent practices.</p></div>
   <div class="footer-section"><h4>Product</h4><a href="/#how-it-works">How It Works</a><a href="/pricing">Pricing</a><a href="/scrubber">Claim Scrubber</a></div>
-  <div class="footer-section"><h4>Legal</h4><a href="#">Privacy Policy</a><a href="#">Terms of Service</a><a href="#">HIPAA Compliance</a></div>
-  <div class="footer-section"><h4>Contact</h4><a href="mailto:hello@clinicosai.com">hello@clinicosai.com</a></div>
-</div><div class="footer-bottom"><p>&copy; 2024 ClinicOS AI. All rights reserved. Made with &#x2764;&#xFE0F; using <a href="https://launchyard.dev" style="color:var(--electric-teal);text-decoration:none;">Launchyard</a>.</p></div></footer>`;
+  <div class="footer-section"><h4>Legal</h4><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a><a href="/baa">Business Associate Agreement</a></div>
+  <div class="footer-section"><h4>Contact</h4><a href="/contact">Contact Us</a><a href="mailto:info@clinicosai.org">info@clinicosai.org</a></div>
+</div><div class="footer-bottom"><p>&copy; 2026 ClinicOS AI. All rights reserved. Made with &#x2764;&#xFE0F; using <a href="https://launchyard.dev" style="color:var(--electric-teal);text-decoration:none;">Launchyard</a>.</p></div></footer>`;
 
 // ─── Pricing Page (fully server-rendered, zero client-side content injection) ──
 
@@ -718,7 +816,7 @@ app.get("/pricing", async (c) => {
     featureRow(CHECK, "Full unlimited scrubber results — no cap"),
     featureRow(CHECK, "Payer-specific rule profiles (Medicare, Medicaid, BCBS, United, Aetna, Cigna, Humana)"),
     featureRow(CHECK, `Appeal letter generator — AI-drafted letters for 26+ denial codes`),
-    featureRow(CHECK, `EHR / PM system import — Kareo, AdvancedMD${badge("DrChrono — Coming Soon","#7c3aed","#ede9fe")}`),
+    featureRow(CHECK, `EHR / PM system import — Kareo, AdvancedMD, DrChrono`),
     featureRow(CHECK, `Real-time eligibility check${badge("Demo Mode","#d97706","#fef3c7")}`),
     featureRow(LOCK, "Team seats"),
     featureRow(LOCK, "Bulk scrubbing"),
@@ -796,7 +894,7 @@ app.get("/pricing", async (c) => {
     ${sectionHeader("Integrations")}
     ${row("User account and claim history", true, true, true)}
     ${row("EHR / PM import — Kareo, AdvancedMD", false, true, true)}
-    ${row("DrChrono OAuth (coming soon)", false, true, true)}
+    ${row("DrChrono OAuth", false, true, true)}
     ${row("Real-time eligibility check", false, true, true)}
     ${sectionHeader("Team &amp; Admin")}
     ${row("Multi-user team seats (up to 5 users)", false, false, true)}
@@ -815,7 +913,7 @@ app.get("/pricing", async (c) => {
     { q: "Is there a free trial?", a: "Yes — all plans include a 14-day free trial. Your card is not charged until the trial ends, and you can cancel anytime before that." },
     { q: "Can I switch plans?", a: "Yes. You can upgrade or downgrade at any time from your account settings. Changes take effect immediately; billing is prorated." },
     { q: "Is it HIPAA compliant?", a: "Yes. All data is encrypted at rest and in transit using AES-256 and TLS 1.3. A Business Associate Agreement (BAA) is available on all plans at no extra charge." },
-    { q: "Which EHR systems do you support?", a: "Kareo/Tebra and AdvancedMD are fully live and available on Growth and Professional plans. DrChrono OAuth integration is in active development and coming soon." },
+    { q: "Which EHR systems do you support?", a: "Kareo/Tebra, AdvancedMD, and DrChrono are all fully live and available on Growth and Professional plans. Connect them from your Settings page to import claims directly." },
     { q: "What denial codes does the appeal generator cover?", a: "The appeal generator covers 26+ codes including CO-4, CO-11, CO-97, PR-96, CO-45, PR-1, CO-16, CO-22, CO-50, OA-18, OA-23, and all major CARCs and RARCs. New codes are added regularly." },
   ].map(({q, a}) => `
 <details style="background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;padding:1.2rem 1.5rem;margin-bottom:.85rem;">
@@ -917,6 +1015,12 @@ ${FOOTER}
 // ─── Home Page ─────────────────────────────────────────────────────────────────
 app.get("/", async (c) => {
   const user = await getCurrentUser(c);
+  // Store referral code cookie if ?ref= param present
+  const refCode = new URL(c.req.url).searchParams.get("ref");
+  const refCookieHeader: string[] = [];
+  if (refCode && /^[A-Z0-9]{8}$/.test(refCode)) {
+    refCookieHeader.push(`ref_code=${refCode}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 3600}`);
+  }
   return c.html(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -985,6 +1089,7 @@ ${buildNav(user)}
   <p class="subheadline">ClinicOS AI is like Grammarly for your medical billing &#x2014; it catches errors, flags denials before they happen, and drafts your appeals automatically.</p>
   <div class="hero-ctas">
     <a href="/scrubber" class="btn btn-primary">Try the Claim Scrubber Free &#x2197;</a>
+    ${!user ? '<a href="/scrubber?demo=true" class="btn btn-secondary" style="display:inline-flex;align-items:center;gap:.4rem">&#x25B6; Try a Demo</a>' : ''}
     <button class="btn btn-secondary" onclick="document.getElementById('how-it-works').scrollIntoView({behavior:'smooth'})">See How It Works</button>
   </div>
   <p class="hero-social-proof">&#x2713; Built for independent clinics, dental practices &amp; urgent care centers. No signup required.</p>
@@ -1069,8 +1174,247 @@ function pricingClick(el){el.disabled=true;el.style.opacity='.7';el.style.cursor
 </script>
 <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
 <script>navigator.sendBeacon("/api/_ping");</script>
-</body></html>`);
+</body></html>`, 200, refCookieHeader.length > 0 ? { "Set-Cookie": refCookieHeader[0] } : {});
 });
+
+// ─── Demo Mode helpers ─────────────────────────────────────────────────────────
+
+interface DemoClaimRow {
+  row_number: number;
+  claim_id: string;
+  patient_id: string;
+  date_of_service: string;
+  cpt_code: string;
+  issue_type: string;
+  severity: "High" | "Medium" | "Low";
+  rule_source: string;
+  description: string;
+  suggested_fix: string;
+}
+interface DemoCleanRow {
+  row_number: number;
+  claim_id: string;
+  patient_id: string;
+  date_of_service: string;
+  cpt_code: string;
+}
+
+function buildDemoScrubberResults(): { flagged: DemoClaimRow[]; clean: DemoCleanRow[] } {
+  const flagged: DemoClaimRow[] = [
+    // 2 missing modifier
+    { row_number: 1,  claim_id: "CLM-0001", patient_id: "PT-0012", date_of_service: "2024-11-04", cpt_code: "99214", issue_type: "Missing Modifier", severity: "High",   rule_source: "General Rule",  description: "CPT 99214 billed without required modifier for a subsequent outpatient visit. Payer expects modifier -25 when E&M is billed same day as a procedure.", suggested_fix: "Add modifier -25 to CPT 99214 if a significant, separately identifiable E&M was performed on the same day as another procedure." },
+    { row_number: 4,  claim_id: "CLM-0004", patient_id: "PT-0031", date_of_service: "2024-11-07", cpt_code: "93000", issue_type: "Missing Modifier", severity: "Medium", rule_source: "General Rule",  description: "ECG interpretation (CPT 93000) submitted without a technical-component modifier. When the physician only interprets and does not own the equipment, modifier -26 is required.", suggested_fix: "Add modifier -26 (professional component only) to CPT 93000 if the clinic does not own the ECG equipment." },
+    // 3 CPT/ICD-10 mismatches
+    { row_number: 2,  claim_id: "CLM-0002", patient_id: "PT-0019", date_of_service: "2024-11-05", cpt_code: "29881", issue_type: "CPT/ICD-10 Mismatch", severity: "High",   rule_source: "General Rule",  description: "Arthroscopic partial meniscectomy (CPT 29881) is paired with diagnosis M79.3 (Panniculitis) — a soft-tissue disorder unrelated to the knee. Payer will deny due to medical necessity mismatch.", suggested_fix: "Verify the ICD-10 code. Expected codes include M23.2xx (derangement of meniscus) or M23.6xx (other spontaneous disruption of ligament). Correct the diagnosis before submission." },
+    { row_number: 6,  claim_id: "CLM-0006", patient_id: "PT-0044", date_of_service: "2024-11-08", cpt_code: "71046", issue_type: "CPT/ICD-10 Mismatch", severity: "High",   rule_source: "General Rule",  description: "Chest X-ray (CPT 71046) is paired with Z00.00 (routine adult health exam). Most payers require a symptomatic or screening-justified diagnosis for radiology services. Z00.00 alone is typically insufficient.", suggested_fix: "Add a supporting diagnosis (e.g., Z87.891 personal history of nicotine dependence, or R05.9 cough) alongside Z00.00, or confirm payer policy allows Z00.00 for this service." },
+    { row_number: 10, claim_id: "CLM-0010", patient_id: "PT-0058", date_of_service: "2024-11-12", cpt_code: "96372", issue_type: "CPT/ICD-10 Mismatch", severity: "Medium", rule_source: "General Rule",  description: "Therapeutic injection (CPT 96372) is paired with K21.0 (GERD with esophagitis). There is no clinical pathway that links this injection code to a GI diagnosis. Likely a coding error.", suggested_fix: "Review the encounter note. If the injection was for a musculoskeletal or allergic condition, update the ICD-10 code to match (e.g., M54.5 low back pain, J30.1 allergic rhinitis)." },
+    // 2 duplicate claims
+    { row_number: 3,  claim_id: "CLM-0003", patient_id: "PT-0025", date_of_service: "2024-11-05", cpt_code: "99213", issue_type: "Duplicate Claim",     severity: "High",   rule_source: "General Rule",  description: "CPT 99213 for patient PT-0025 on 2024-11-05 appears twice in this file (rows 3 and 8). Submitting both will result in OA-18 (exact duplicate) denial on the second claim.", suggested_fix: "Remove the duplicate row (row 8) before submission. If both encounters were distinct, ensure each has a unique date of service or distinct supporting documentation." },
+    { row_number: 8,  claim_id: "CLM-0008", patient_id: "PT-0025", date_of_service: "2024-11-05", cpt_code: "99213", issue_type: "Duplicate Claim",     severity: "High",   rule_source: "General Rule",  description: "Exact duplicate of row 3 — same patient PT-0025, same date 2024-11-05, same CPT 99213. Second submission will be denied with denial code OA-18.", suggested_fix: "Remove this row (row 8) if it is a submission error. If a second distinct service was rendered, use a different CPT code or date of service." },
+    // 2 unit limit violations
+    { row_number: 5,  claim_id: "CLM-0005", patient_id: "PT-0037", date_of_service: "2024-11-07", cpt_code: "97110", issue_type: "Unit Limit Violation", severity: "Medium", rule_source: "General Rule",  description: "Therapeutic exercises (CPT 97110) billed at 12 units. Standard payer policy caps CPT 97110 at 8 units per date of service without a clinical exception on file.", suggested_fix: "Reduce units to 8, or attach medical-necessity documentation supporting 12 units. Confirm the patient's plan allows extended therapy sessions." },
+    { row_number: 9,  claim_id: "CLM-0009", patient_id: "PT-0051", date_of_service: "2024-11-11", cpt_code: "90837", issue_type: "Unit Limit Violation", severity: "Medium", rule_source: "General Rule",  description: "Psychotherapy 60-min (CPT 90837) billed with 3 units. This code is an 'each service' code; billing > 1 unit per date of service is invalid and triggers automatic denial.", suggested_fix: "Set units to 1. If three separate 60-min sessions occurred, they must be billed on separate claim lines with individual dates of service." },
+    // 1 Medicare MUE / payer-specific
+    { row_number: 7,  claim_id: "CLM-0007", patient_id: "PT-0049", date_of_service: "2024-11-09", cpt_code: "11042", issue_type: "MUE Violation",        severity: "High",   rule_source: "Medicare MUE", description: "Debridement, subcutaneous tissue (CPT 11042) billed at 6 units. Medicare Medically Unlikely Edit (MUE) for CPT 11042 is 3 units per day. Claims exceeding the MUE are automatically reduced or denied by Medicare's edit system.", suggested_fix: "Reduce to 3 units (Medicare MUE limit). If debridement exceeded 20 sq cm, bill additional units with CPT 11045 (each additional 20 sq cm) appended in a separate line." },
+  ];
+
+  const clean: DemoCleanRow[] = [
+    { row_number: 11, claim_id: "CLM-0011", patient_id: "PT-0060", date_of_service: "2024-11-13", cpt_code: "99212" },
+    { row_number: 12, claim_id: "CLM-0012", patient_id: "PT-0063", date_of_service: "2024-11-13", cpt_code: "85025" },
+    { row_number: 13, claim_id: "CLM-0013", patient_id: "PT-0067", date_of_service: "2024-11-14", cpt_code: "36415" },
+    { row_number: 14, claim_id: "CLM-0014", patient_id: "PT-0071", date_of_service: "2024-11-14", cpt_code: "99203" },
+    { row_number: 15, claim_id: "CLM-0015", patient_id: "PT-0075", date_of_service: "2024-11-15", cpt_code: "93000" },
+  ];
+
+  return { flagged, clean };
+}
+
+// escHtml already defined above — reusing it; wrapper for number support
+function escH(s: string | number): string {
+  return escHtml(String(s));
+}
+
+function renderDemoResultsPage(data: { flagged: DemoClaimRow[]; clean: DemoCleanRow[] }, user: SessionUser | null): string {
+  const { flagged, clean } = data;
+  const total = flagged.length + clean.length;
+  const hi = flagged.filter(r => r.severity === "High").length;
+  const md = flagged.filter(r => r.severity === "Medium").length;
+  const lo = flagged.filter(r => r.severity === "Low").length;
+
+  const flaggedRows = flagged.map(row => {
+    const ruleSource = row.rule_source === "Medicare MUE"
+      ? `<div style="font-size:.75rem;color:#7c3aed;margin-top:.25rem;font-weight:600">&#x2756; ${escH(row.rule_source)}</div>`
+      : (row.rule_source ? `<div style="font-size:.75rem;color:#7c3aed;margin-top:.25rem;font-weight:600">&#x2756; ${escH(row.rule_source)}</div>` : "");
+    return `<tr>
+      <td style="font-weight:600;color:#94a3b8;font-size:.8rem">${escH(row.row_number)}</td>
+      <td style="font-weight:600;color:var(--navy);font-size:.85rem">${escH(row.claim_id)}</td>
+      <td>${escH(row.patient_id)}</td>
+      <td style="white-space:nowrap">${escH(row.date_of_service)}</td>
+      <td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.85rem;font-weight:600">${escH(row.cpt_code)}</code></td>
+      <td><div class="issue-type-tag">${escH(row.issue_type)}</div><div class="issue-desc">${escH(row.description)}</div>${ruleSource}</td>
+      <td><span class="sev-badge sev-${escH(row.severity)}"><span class="sev-dot"></span>${escH(row.severity)}</span></td>
+      <td><div class="fix-text">${escH(row.suggested_fix)}</div></td>
+    </tr>`;
+  }).join("");
+
+  const cleanRows = clean.map(r =>
+    `<tr><td>${escH(r.row_number)}</td><td>${escH(r.claim_id)}</td><td>${escH(r.patient_id)}</td><td>${escH(r.date_of_service)}</td><td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.85rem;font-weight:600">${escH(r.cpt_code)}</code></td></tr>`
+  ).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Demo: AI Claim Scrubber &#x2014; ClinicOS AI</title>
+<style>
+${SHARED_STYLES}
+body{background:#f1f5f9}
+.scrubber-hero{background:linear-gradient(135deg,var(--navy) 0%,#0d2144 100%);color:#fff;padding:3.5rem 2rem 4rem;text-align:center;position:relative;overflow:hidden}
+.scrubber-hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 70% 50%,rgba(6,182,212,.15) 0%,transparent 60%);pointer-events:none}
+.scrubber-hero .badge-demo{display:inline-block;background:rgba(251,191,36,.2);border:1px solid rgba(251,191,36,.5);color:#fde68a;border-radius:20px;padding:.25rem .9rem;font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:1rem}
+.scrubber-hero h1{font-size:2.75rem;font-weight:800;margin-bottom:.75rem;letter-spacing:-.5px;position:relative}
+.scrubber-hero p{color:rgba(255,255,255,.8);font-size:1.1rem;max-width:580px;margin:0 auto;position:relative}
+.scrubber-body{max-width:920px;margin:0 auto;padding:2.5rem 1.5rem 4rem}
+.demo-banner{background:#fef9c3;border:2px solid #f59e0b;border-radius:14px;padding:1.25rem 1.75rem;margin-bottom:1.75rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+.demo-banner-icon{font-size:1.75rem;flex-shrink:0}
+.demo-banner-text{flex:1;min-width:0}
+.demo-banner-text strong{display:block;color:#92400e;font-size:1rem;font-weight:800;margin-bottom:.2rem}
+.demo-banner-text span{color:#78350f;font-size:.92rem}
+.demo-banner-cta{background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));color:#fff;border:none;border-radius:10px;padding:.65rem 1.4rem;font-size:.92rem;font-weight:700;text-decoration:none;white-space:nowrap;display:inline-block;transition:opacity .2s}
+.demo-banner-cta:hover{opacity:.88}
+.summary-bar{background:linear-gradient(135deg,var(--navy),#0d2144);color:#fff;border-radius:14px;padding:1.4rem 1.75rem;display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem;box-shadow:0 4px 20px rgba(15,23,42,.25)}
+.summary-stats{display:flex;gap:2rem;flex-wrap:wrap}
+.summary-stat{text-align:center;min-width:48px}
+.summary-stat .num{font-size:1.9rem;font-weight:800;line-height:1}
+.summary-stat .lbl{font-size:.7rem;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.5px;margin-top:.2rem}
+.num-red{color:#f87171}.num-amber{color:#fbbf24}.num-blue{color:#60a5fa}.num-green{color:#34d399}
+.sep{width:1px;background:rgba(255,255,255,.15);align-self:stretch;margin:0 .5rem}
+.table-wrap{overflow-x:auto;border-radius:12px;border:1px solid #e2e8f0}
+table{width:100%;border-collapse:collapse;font-size:.875rem}
+thead{background:var(--navy)}
+thead th{padding:.85rem 1rem;text-align:left;color:rgba(255,255,255,.85);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.6px;white-space:nowrap}
+tbody tr{border-bottom:1px solid #f1f5f9;transition:background .15s ease}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:#f8fafc}
+tbody td{padding:.9rem 1rem;color:#334155;vertical-align:top;line-height:1.5}
+.sev-badge{display:inline-flex;align-items:center;gap:.3rem;padding:.25rem .65rem;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+.sev-High{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
+.sev-Medium{background:#fffbeb;color:#b45309;border:1px solid #fde68a}
+.sev-Low{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.sev-dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
+.issue-type-tag{font-weight:600;color:var(--navy);font-size:.78rem;background:#f1f5f9;display:inline-block;padding:.15rem .5rem;border-radius:4px;margin-bottom:.35rem;border:1px solid #e2e8f0}
+.issue-desc{color:#475569;font-size:.84rem;line-height:1.55}
+.fix-text{color:#0369a1;font-size:.82rem;font-style:italic;margin-top:.3rem;line-height:1.5}
+.clean-panel{background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:12px;padding:1.1rem 1.5rem;display:flex;align-items:center;justify-content:space-between;gap:.75rem;cursor:pointer;user-select:none;margin-top:1.25rem}
+.clean-panel-info{display:flex;align-items:center;gap:.75rem}
+.clean-icon{font-size:1.4rem}
+.clean-title{color:#166534;font-weight:700;font-size:.95rem}
+.clean-sub{color:#15803d;font-size:.82rem}
+.clean-toggle{color:#166534;font-weight:700;font-size:.82rem}
+.clean-list-wrap{display:none;margin-top:.75rem;border-top:1px solid #bbf7d0;padding-top:.75rem}
+.clean-list-wrap.open{display:block}
+.clean-tbl{width:100%;font-size:.8rem;color:#475569;border-collapse:collapse}
+.clean-tbl td{padding:.3rem .5rem}
+.clean-tbl tr:nth-child(even){background:#f7fef9}
+.trial-cta-box{background:linear-gradient(135deg,var(--navy),#0d2144);border-radius:16px;padding:2.5rem 2rem;text-align:center;margin-top:2rem;color:#fff}
+.trial-cta-box h2{font-size:1.6rem;font-weight:800;margin-bottom:.75rem}
+.trial-cta-box p{color:rgba(255,255,255,.8);font-size:1rem;max-width:540px;margin:0 auto 1.5rem;line-height:1.7}
+.btn-trial-cta{display:inline-block;background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:12px;padding:1rem 2.5rem;font-size:1.1rem;font-weight:800;text-decoration:none;letter-spacing:.2px;transition:all .2s ease;box-shadow:0 8px 24px rgba(16,185,129,.35)}
+.btn-trial-cta:hover{transform:translateY(-2px);box-shadow:0 12px 32px rgba(16,185,129,.45);opacity:.95}
+.trial-reassurance{display:flex;justify-content:center;gap:1.5rem;margin-top:1rem;flex-wrap:wrap;font-size:.85rem;color:rgba(255,255,255,.65)}
+.trial-reassurance span{display:flex;align-items:center;gap:.3rem}
+@media(max-width:640px){.summary-bar{flex-direction:column;text-align:center}.summary-stats{gap:1rem;justify-content:center}.scrubber-hero h1{font-size:1.85rem}.sep{display:none}.demo-banner{flex-direction:column;text-align:center}}
+</style>
+</head>
+<body>
+${buildNav(user)}
+<div class="scrubber-hero">
+  <div class="badge-demo">&#x1F9EA; Demo Mode</div>
+  <h1>AI Claim Scrubber</h1>
+  <p>See exactly what ClinicOS AI catches &mdash; using sample claim data with realistic errors.</p>
+</div>
+<div class="scrubber-body">
+  <!-- Demo banner -->
+  <div class="demo-banner">
+    <span class="demo-banner-icon">&#x1F9EA;</span>
+    <div class="demo-banner-text">
+      <strong>This is sample data. Sign up free to scrub your own claims.</strong>
+      <span>The results below show real error types our AI catches. Your actual claims may have different issues &mdash; upload your own file to find out.</span>
+    </div>
+    <a href="/signup?trial=14" class="demo-banner-cta">Sign Up Free &#x2192;</a>
+  </div>
+
+  <!-- Summary bar -->
+  <div class="summary-bar">
+    <div class="summary-stats">
+      <div class="summary-stat"><div class="num num-red">${flagged.length}</div><div class="lbl">Flagged</div></div>
+      <div class="sep"></div>
+      <div class="summary-stat"><div class="num num-red">${hi}</div><div class="lbl">High</div></div>
+      <div class="summary-stat"><div class="num num-amber">${md}</div><div class="lbl">Medium</div></div>
+      <div class="summary-stat"><div class="num num-blue">${lo}</div><div class="lbl">Low</div></div>
+      <div class="sep"></div>
+      <div class="summary-stat"><div class="num num-green">${clean.length}</div><div class="lbl">Clean</div></div>
+      <div class="sep"></div>
+      <div class="summary-stat"><div class="num">${total}</div><div class="lbl">Total Claims</div></div>
+    </div>
+    <div style="font-size:.8rem;color:rgba(255,255,255,.5);font-style:italic">Sample data</div>
+  </div>
+
+  <!-- Results table -->
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Row</th><th>Claim ID</th><th>Patient ID</th><th>Date of Service</th>
+          <th>CPT Code</th><th>Issue</th><th>Severity</th><th>Suggested Fix</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${flaggedRows}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Clean claims accordion -->
+  <div class="clean-panel" onclick="toggleCleanList(this)">
+    <div class="clean-panel-info">
+      <span class="clean-icon">&#x2705;</span>
+      <div>
+        <div class="clean-title">${clean.length} claims passed with no errors</div>
+        <div class="clean-sub">Click to expand</div>
+      </div>
+    </div>
+    <span class="clean-toggle">&#x25BC;</span>
+  </div>
+  <div class="clean-list-wrap" id="cleanListWrap">
+    <table class="clean-tbl">
+      <thead><tr><th>Row</th><th>Claim ID</th><th>Patient ID</th><th>Date of Service</th><th>CPT Code</th></tr></thead>
+      <tbody>${cleanRows}</tbody>
+    </table>
+  </div>
+
+  <!-- Trial CTA -->
+  <div class="trial-cta-box">
+    <h2>&#x1F680; Ready to scrub your own claims?</h2>
+    <p>Start your 14-day free trial and upload your real claims CSV. ClinicOS AI will catch errors like these before they become denials &mdash; saving you hours of rework.</p>
+    <a href="/signup?trial=14" class="btn-trial-cta">Start Free Trial &mdash; No Credit Card Required &#x2197;</a>
+    <div class="trial-reassurance">
+      <span>&#x2713; 14-day free trial</span>
+      <span>&#x2713; No credit card required</span>
+      <span>&#x2713; Cancel anytime</span>
+    </div>
+  </div>
+</div>
+<script>
+function toggleCleanList(panel){
+  const wrap=document.getElementById('cleanListWrap');
+  const toggle=panel.querySelector('.clean-toggle');
+  if(wrap.classList.toggle('open')){toggle.textContent='▲';}else{toggle.textContent='▼';}
+}
+</script>
+${FOOTER}
+</body></html>`;
+}
 
 // ─── Scrubber Page ─────────────────────────────────────────────────────────────
 app.get("/scrubber", async (c) => {
@@ -1096,6 +1440,13 @@ app.get("/scrubber", async (c) => {
   const url = new URL(c.req.url);
   const pmConnected = url.searchParams.get("pm_connected");
   const pmError = url.searchParams.get("pm_error");
+  const isDemo = url.searchParams.get("demo") === "true";
+
+  // ── Demo mode: return results page with hardcoded sample data ────────────
+  if (isDemo) {
+    const demoData = buildDemoScrubberResults();
+    return c.html(renderDemoResultsPage(demoData, user));
+  }
 
   return c.html(`<!DOCTYPE html>
 <html lang="en">
@@ -1231,6 +1582,7 @@ ${buildNav(user)}
   <div class="badge-free">${accessLevel === 'paid' ? '&#x2713; Unlimited Access' : accessLevel === 'trial_active' ? '&#x2713; Free Trial &#x2022; Full Access' : accessLevel === 'trial_expired' ? '&#x26A0; Trial Ended' : 'Free &#x2022; Preview First 3 Results'}</div>
   <h1>AI Claim Scrubber</h1>
   <p>Upload your claims CSV and get an instant error report with severity ratings and suggested fixes.</p>
+  ${!user ? '<div style="margin-top:1.25rem"><a href="/scrubber?demo=true" style="display:inline-flex;align-items:center;gap:.5rem;background:rgba(255,255,255,.12);border:1.5px solid rgba(255,255,255,.35);color:#fff;border-radius:10px;padding:.6rem 1.4rem;font-size:.93rem;font-weight:700;text-decoration:none;transition:background .2s" onmouseover="this.style.background=\'rgba(255,255,255,.2)\'" onmouseout="this.style.background=\'rgba(255,255,255,.12)\'">&#x25B6; See a live demo &mdash; no signup needed</a></div>' : ''}
 </div>
 ${accessLevel === 'trial_expired' ? `
 <div style="max-width:920px;margin:2rem auto 0;padding:0 1.5rem">
@@ -1239,7 +1591,7 @@ ${accessLevel === 'trial_expired' ? `
     <h2 style="color:#991b1b;font-size:1.35rem;font-weight:800;margin-bottom:.6rem">Your free trial has ended</h2>
     <p style="color:#7f1d1d;font-size:.97rem;max-width:480px;margin:0 auto 1.5rem">Upgrade to a paid plan to continue running AI claim analyses, saving reports, and catching denial risks before submission.</p>
     <a href="/#pricing" class="btn btn-primary" style="display:inline-block;padding:.85rem 2rem;font-size:1rem;font-weight:700;background:linear-gradient(135deg,#dc2626,#b91c1c);border:none;border-radius:10px;color:#fff;text-decoration:none">View Plans &#x2192;</a>
-    <p style="margin-top:1rem;font-size:.85rem;color:#9ca3af">Questions? <a href="mailto:support@clinicosal.launchyard.app" style="color:#dc2626">Contact support</a></p>
+    <p style="margin-top:1rem;font-size:.85rem;color:#9ca3af">Questions? <a href="mailto:info@clinicosai.org" style="color:#dc2626">Contact support</a></p>
   </div>
 </div>` : ''}
 <div class="scrubber-body">
@@ -1445,13 +1797,13 @@ ${accessLevel === 'trial_expired' ? `
           </div>
           <button onclick="pmFetchClaims('drchrono','drchronoDays')" style="width:100%;padding:.6rem;background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:.88rem;cursor:pointer;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">&#x2B07; Fetch Recent Claims</button>
         ` : !drchronoConfigured ? `
-          <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:.75rem;margin-bottom:.5rem">
-            <p style="color:#64748b;font-size:.82rem;font-weight:600;margin-bottom:.2rem">&#x1F6A7; Coming Soon — OAuth setup required</p>
-            <p style="color:#94a3b8;font-size:.78rem">DrChrono OAuth setup in progress — contact support to enable.</p>
+          <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:.75rem;margin-bottom:.5rem">
+            <p style="color:#dc2626;font-size:.82rem;font-weight:600;margin-bottom:.2rem">DrChrono integration not configured</p>
+            <p style="color:#64748b;font-size:.78rem">Set DRCHRONO_CLIENT_ID and DRCHRONO_CLIENT_SECRET in the Cloudflare Workers dashboard to enable.</p>
           </div>
         ` : canConnectPm ? `
-          <p style="color:#64748b;font-size:.83rem;margin-bottom:.75rem">Click below to authorize ClinicOS AI to read your DrChrono billing data.</p>
-          <a href="/api/pm/drchrono/connect" style="display:block;width:100%;padding:.6rem;background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:.88rem;cursor:pointer;text-align:center;text-decoration:none;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">Connect DrChrono</a>
+          <p style="color:#64748b;font-size:.83rem;margin-bottom:.75rem">Connect your DrChrono account on the <a href="/settings" style="color:#7c3aed;font-weight:600">Settings page</a> to import claims via OAuth.</p>
+          <a href="/settings" style="display:block;width:100%;padding:.6rem;background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:.88rem;cursor:pointer;text-align:center;text-decoration:none;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">Connect DrChrono in Settings</a>
         ` : `
           <p style="color:#94a3b8;font-size:.83rem;margin-bottom:.75rem">Connect your DrChrono account to import claims via OAuth.</p>
           <button disabled title="${user ? 'Upgrade to Growth or Professional to connect PM systems' : 'Sign up to connect PM systems'}" style="width:100%;padding:.6rem;background:#e2e8f0;color:#94a3b8;border:none;border-radius:8px;font-weight:700;font-size:.88rem;cursor:not-allowed">${user ? '&#x1F512; Upgrade to Connect' : '&#x1F512; Sign Up to Connect'}</button>
@@ -2056,7 +2408,10 @@ async function pmFetchClaims(system,daysSelectId){
     if(!r.ok){
       if(loadEl)loadEl.style.display='none';
       if(errEl){errEl.style.display='flex';}
-      if(errMsg)errMsg.textContent=d.error||('Failed to fetch claims from '+systemLabel);
+      const reconnectHtml = (d.code==='drchrono_token_expired')
+        ? ' <a href="/settings" style="color:#dc2626;font-weight:700;text-decoration:underline">Reconnect DrChrono →</a>'
+        : '';
+      if(errMsg)errMsg.innerHTML=(d.error||('Failed to fetch claims from '+systemLabel))+reconnectHtml;
       document.getElementById('uploadCard').style.display='block';
       return;
     }
@@ -2434,18 +2789,32 @@ app.post("/signup", async (c) => {
   const userId = generateId();
   const salt = generateId();
   const hash = await hashPassword(password, salt);
-  await c.env.DB.prepare("INSERT INTO users (id, email, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?, unixepoch())").bind(userId, email, hash, salt).run();
+  // Check for referral code cookie
+  const cookies = parseCookies(c.req.header("Cookie") || "");
+  const refCode = cookies["ref_code"] || "";
+  let referrerId: string | null = null;
+  if (refCode && /^[A-Z0-9]{8}$/.test(refCode)) {
+    const refUser = await c.env.DB.prepare("SELECT id FROM users WHERE referral_code = ?").bind(refCode).first<{ id: string }>();
+    if (refUser && refUser.id !== userId) referrerId = refUser.id;
+  }
+  await c.env.DB.prepare("INSERT INTO users (id, email, password_hash, password_salt, referred_by, created_at) VALUES (?, ?, ?, ?, ?, unixepoch())").bind(userId, email, hash, salt, referrerId).run();
+  // Create referral_credits pending row
+  if (referrerId) {
+    const creditId = generateId();
+    const now = Math.floor(Date.now() / 1000);
+    await c.env.DB.prepare("INSERT INTO referral_credits (id, referrer_user_id, referred_user_id, created_at) VALUES (?, ?, ?, ?)").bind(creditId, referrerId, userId, now).run().catch(() => {});
+  }
   // Create session
   const sessionId = generateId() + generateId();
   const expiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
   await c.env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)").bind(sessionId, userId, expiresAt).run();
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: "/my-claims",
-      "Set-Cookie": `clinicios_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${30 * 24 * 3600}; Secure`,
-    },
+  const headers = new Headers({
+    Location: "/my-claims",
   });
+  headers.append("Set-Cookie", `clinicios_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${30 * 24 * 3600}; Secure`);
+  // Clear referral code cookie
+  if (refCode) headers.append("Set-Cookie", `ref_code=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  return new Response(null, { status: 302, headers });
 });
 
 // ─── Login ─────────────────────────────────────────────────────────────────────
@@ -2512,6 +2881,15 @@ app.post("/logout", async (c) => {
       "Set-Cookie": "clinicios_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure",
     },
   });
+});
+
+// ─── Onboarding tour dismiss ──────────────────────────────────────────────────
+app.post("/api/onboarding/dismiss", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.json({ error: "unauthorized" }, 401);
+  await c.env.DB.prepare("UPDATE users SET onboarding_tour_dismissed = 1 WHERE id = ?")
+    .bind(user.user_id).run().catch(() => {});
+  return c.json({ ok: true });
 });
 
 // ─── Forgot Password ──────────────────────────────────────────────────────────
@@ -2704,6 +3082,66 @@ ${buildNav(user)}
 ${FOOTER}<script>navigator.sendBeacon("/api/_ping");</script></body></html>`);
   }
 
+  // ── Onboarding checklist data ─────────────────────────────────────────────
+  const now7d = Math.floor(Date.now() / 1000);
+  const accountAge = user.created_at ? (now7d - user.created_at) : 999999;
+  const showOnboarding = !user.onboarding_tour_dismissed && accountAge < 7 * 86400;
+  let onboardingStep1 = false, onboardingStep2 = false, onboardingStep3 = false;
+  if (showOnboarding) {
+    const afOb = accountFilter(user);
+    const [scrubRow, denialRow, appealRow] = await Promise.all([
+      c.env.DB.prepare(`SELECT COUNT(*) AS n FROM claim_reports WHERE ${afOb.clause}`).bind(afOb.param).first<{ n: number }>(),
+      c.env.DB.prepare(`SELECT COUNT(*) AS n FROM denials WHERE ${afOb.clause}`).bind(afOb.param).first<{ n: number }>(),
+      c.env.DB.prepare(`SELECT COUNT(*) AS n FROM appeal_letters WHERE ${afOb.clause}`).bind(afOb.param).first<{ n: number }>(),
+    ]);
+    onboardingStep1 = (scrubRow?.n ?? 0) > 0;
+    onboardingStep2 = (denialRow?.n ?? 0) > 0;
+    onboardingStep3 = (appealRow?.n ?? 0) > 0;
+  }
+  const onboardingComplete = onboardingStep1 && onboardingStep2 && onboardingStep3;
+  const showOnboardingBanner = showOnboarding && !onboardingComplete;
+  const onboardingDoneCount = [onboardingStep1, onboardingStep2, onboardingStep3].filter(Boolean).length;
+
+  function onboardingStepHtml(done: boolean, num: number, text: string, href: string, btnLabel: string): string {
+    const iconHtml = done
+      ? `<span style="width:28px;height:28px;border-radius:50%;background:#10b981;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:.95rem;font-weight:800;flex-shrink:0">&#x2713;</span>`
+      : `<span style="width:28px;height:28px;border-radius:50%;background:#e2e8f0;color:#94a3b8;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:700;flex-shrink:0">${num}</span>`;
+    const textHtml = done
+      ? `<span style="color:#94a3b8;text-decoration:line-through;font-size:.95rem">${text}</span>`
+      : `<span style="color:#0f172a;font-size:.95rem;font-weight:500">${text}</span>`;
+    const btnHtml = done ? '' : `<a href="${href}" style="margin-left:auto;flex-shrink:0;background:linear-gradient(135deg,#0284c7,#06b6d4);color:#fff;padding:.4rem .9rem;border-radius:7px;text-decoration:none;font-size:.82rem;font-weight:700;white-space:nowrap">${btnLabel} &#x2192;</a>`;
+    return `<div style="display:flex;align-items:center;gap:.85rem;padding:.9rem 0;border-bottom:1px solid #f1f5f9">
+      ${iconHtml}${textHtml}${btnHtml}
+    </div>`;
+  }
+
+  const progressPct = Math.round((onboardingDoneCount / 3) * 100);
+  const onboardingBannerHtml = showOnboardingBanner ? `
+<div id="onboarding-banner" style="background:linear-gradient(135deg,#f0f9ff,#e0f2fe);border:1px solid #bae6fd;border-radius:16px;padding:1.75rem;margin-bottom:1.5rem;position:relative">
+  <button onclick="(function(){fetch('/api/onboarding/dismiss',{method:'POST'});document.getElementById('onboarding-banner').remove()})()" title="Skip tour" style="position:absolute;top:1rem;right:1rem;background:none;border:none;color:#94a3b8;font-size:1.1rem;cursor:pointer;padding:.25rem .5rem;border-radius:6px;line-height:1" onmouseover="this.style.background='#e2e8f0'" onmouseout="this.style.background='none'">&#x2715; <span style="font-size:.78rem;font-weight:600">Skip tour</span></button>
+  <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem">
+    <span style="font-size:1.5rem">&#x1F44B;</span>
+    <div>
+      <h2 style="font-size:1.1rem;font-weight:800;color:#0c4a6e;margin:0 0 .1rem">Welcome to ClinicOS AI &mdash; here&rsquo;s how to get started</h2>
+      <span style="font-size:.85rem;color:#0369a1">${onboardingDoneCount} of 3 steps complete</span>
+    </div>
+  </div>
+  <div style="margin-bottom:1.1rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.35rem">
+      <span style="font-size:.78rem;font-weight:600;color:#0369a1;text-transform:uppercase;letter-spacing:.4px">Progress</span>
+      <span style="font-size:.78rem;font-weight:700;color:#0369a1">${progressPct}%</span>
+    </div>
+    <div style="background:#bae6fd;border-radius:8px;height:8px;overflow:hidden">
+      <div style="background:linear-gradient(90deg,#0284c7,#06b6d4);height:100%;width:${progressPct}%;border-radius:8px;transition:width .4s ease"></div>
+    </div>
+  </div>
+  <div>
+    ${onboardingStepHtml(onboardingStep1, 1, 'Upload your first claim CSV and see errors flagged', '/scrubber', 'Go to Claim Scrubber')}
+    ${onboardingStepHtml(onboardingStep2, 2, 'Log your first denial in the Denial Tracker', '/denial-tracker', 'Go to Denial Tracker')}
+    ${onboardingStepHtml(onboardingStep3, 3, 'Generate your first appeal letter', '/appeal-generator', 'Go to Appeal Generator')}
+  </div>
+</div>` : '';
+
   // List all reports
   const afList = accountFilter(user);
   const reports = await c.env.DB.prepare(
@@ -2715,10 +3153,10 @@ ${FOOTER}<script>navigator.sendBeacon("/api/_ping");</script></body></html>`);
     const flagPct = r.total_claims > 0 ? Math.round(r.flagged_count / r.total_claims * 100) : 0;
     return `<tr>
       <td style="color:#64748b;font-size:.88rem;white-space:nowrap">${escHtml(date)}</td>
-      <td style="font-weight:600;color:#0f172a">${escHtml(r.filename)}</td>
+      <td style="font-weight:600;color:#0f172a">${escH(r.filename)}</td>
       <td style="text-align:center;font-weight:700;color:#0f172a">${r.total_claims}</td>
       <td style="text-align:center"><span style="font-weight:700;color:${r.flagged_count > 0 ? "#dc2626" : "#10b981"}">${r.flagged_count}</span><span style="color:#94a3b8;font-size:.8rem;margin-left:.3rem">(${flagPct}%)</span></td>
-      <td style="text-align:center"><a href="/my-claims?report=${escHtml(r.id)}" style="background:linear-gradient(135deg,#0284c7,#06b6d4);color:#fff;padding:.45rem 1rem;border-radius:6px;text-decoration:none;font-size:.85rem;font-weight:600;white-space:nowrap;display:inline-block;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">View Report &#x2197;</a></td>
+      <td style="text-align:center"><a href="/my-claims?report=${escH(r.id)}" style="background:linear-gradient(135deg,#0284c7,#06b6d4);color:#fff;padding:.45rem 1rem;border-radius:6px;text-decoration:none;font-size:.85rem;font-weight:600;white-space:nowrap;display:inline-block;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">View Report &#x2197;</a></td>
     </tr>`;
   }).join("");
 
@@ -2752,10 +3190,10 @@ ${FOOTER}<script>navigator.sendBeacon("/api/_ping");</script></body></html>`);
     appealLetterData[r.id] = { text: r.letter_text, code: r.denial_code, label: r.denial_label };
     return `<tr>
       <td style="color:#64748b;font-size:.88rem;white-space:nowrap">${escHtml(date)}</td>
-      <td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.83rem;font-weight:700">${escHtml(r.denial_code)}</code><div style="color:#64748b;font-size:.8rem;margin-top:.2rem">${escHtml(r.denial_label)}</div></td>
-      <td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.83rem;font-weight:700">${escHtml(r.cpt_code)}</code></td>
-      <td style="font-size:.88rem">${escHtml(r.payer_name)}</td>
-      <td style="text-align:center"><button data-id="${escHtml(r.id)}" class="view-letter-btn" style="background:linear-gradient(135deg,#0284c7,#06b6d4);color:#fff;padding:.45rem 1rem;border-radius:6px;border:none;font-size:.85rem;font-weight:600;cursor:pointer;white-space:nowrap;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">View Letter &#x2197;</button></td>
+      <td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.83rem;font-weight:700">${escH(r.denial_code)}</code><div style="color:#64748b;font-size:.8rem;margin-top:.2rem">${escH(r.denial_label)}</div></td>
+      <td><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.83rem;font-weight:700">${escH(r.cpt_code)}</code></td>
+      <td style="font-size:.88rem">${escH(r.payer_name)}</td>
+      <td style="text-align:center"><button data-id="${escH(r.id)}" class="view-letter-btn" style="background:linear-gradient(135deg,#0284c7,#06b6d4);color:#fff;padding:.45rem 1rem;border-radius:6px;border:none;font-size:.85rem;font-weight:600;cursor:pointer;white-space:nowrap;transition:opacity .2s" onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">View Letter &#x2197;</button></td>
     </tr>`;
   }).join("");
 
@@ -2794,8 +3232,8 @@ ${FOOTER}<script>navigator.sendBeacon("/api/_ping");</script></body></html>`);
     const badge = statusLabels[r.result_status] || statusLabels["unverified"];
     return `<tr>
       <td style="color:#64748b;font-size:.88rem;white-space:nowrap">${escHtml(date)}</td>
-      <td style="font-weight:600;color:#0f172a">****${escHtml(r.member_id_last4)}</td>
-      <td style="color:#0f172a">${escHtml(r.payer)}</td>
+      <td style="font-weight:600;color:#0f172a">****${escH(r.member_id_last4)}</td>
+      <td style="color:#0f172a">${escH(r.payer)}</td>
       <td style="text-align:center"><code style="background:#f1f5f9;padding:.15rem .5rem;border-radius:5px;font-size:.82rem;font-weight:600">${r.cpt_code ? escHtml(r.cpt_code) : '<span style="color:#94a3b8">—</span>'}</code></td>
       <td>${badge}</td>
     </tr>`;
@@ -2847,6 +3285,7 @@ tbody td{padding:.9rem 1rem;vertical-align:middle}
 </style></head><body>
 ${buildNav(user)}
 <div class="claims-wrap">
+  ${onboardingBannerHtml}
   <div style="margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem">
     <div>
       <h1 style="font-size:2rem;font-weight:800;color:#0f172a;margin-bottom:.3rem">My Claims</h1>
@@ -3018,6 +3457,11 @@ app.get("/checkout/success", async (c) => {
         if (sale.customer_email) {
           await c.env.DB.prepare("UPDATE users SET stripe_customer_id = ?, plan = ? WHERE email = ?")
             .bind(sessionId, "starter", sale.customer_email.toLowerCase()).run().catch(() => {});
+          // Apply referral credit if this user was referred
+          const paidUser = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(sale.customer_email.toLowerCase()).first<{ id: string }>();
+          if (paidUser) {
+            await applyReferralCredit(c.env.DB, paidUser.id).catch(() => {});
+          }
         }
       }
     } catch { /**/ }
@@ -3413,10 +3857,10 @@ Source: CMS & MGMA published benchmarks. ClinicOS AI platform data.`;
         const appealUrl = `/appeal-generator?denial_code=${encodeURIComponent(r.denial_reason_code)}&cpt=${encodeURIComponent(r.cpt_code)}&payer=${encodeURIComponent(r.payer)}&date=${encodeURIComponent(r.date_of_service)}&amount=${encodeURIComponent(r.claim_amount)}`;
         const amount = `$${r.claim_amount.toFixed(2)}`;
         return `<tr>
-          <td>${escHtml(r.date_of_service)}</td>
-          <td>${escHtml(r.payer)}</td>
-          <td><code>${escHtml(r.cpt_code)}</code></td>
-          <td><span class="reason-badge">${escHtml(r.denial_reason_code)}</span> <span class="reason-label">${escHtml(r.denial_reason_label)}</span></td>
+          <td>${escH(r.date_of_service)}</td>
+          <td>${escH(r.payer)}</td>
+          <td><code>${escH(r.cpt_code)}</code></td>
+          <td><span class="reason-badge">${escH(r.denial_reason_code)}</span> <span class="reason-label">${escH(r.denial_reason_label)}</span></td>
           <td>${escHtml(amount)}</td>
           <td><a href="${escHtml(appealUrl)}" class="btn-appeal">Generate Appeal &#x2197;</a></td>
         </tr>`;
@@ -4783,6 +5227,356 @@ const TEAM_STYLES = `
 .remove-btn:hover{background:#fef2f2}
 `;
 
+// ─── Subscription Update Webhook (from Launchyard) ────────────────────────────
+app.post("/api/launchyard/subscription-update", async (c) => {
+  const authHeader = c.req.header("Authorization") || "";
+  if (authHeader !== `Bearer ${c.env.LAUNCHYARD_API_KEY}`) return c.json({ error: "Unauthorized" }, 401);
+  try {
+    const body = await c.req.json() as {
+      subscription?: { status?: string; customer_email?: string; client_reference_id?: string };
+      event_type?: string;
+    };
+    const sub = body.subscription;
+    if (!sub) return c.json({ ok: true });
+    const status = sub.status || "";
+    const email = (sub.customer_email || "").toLowerCase();
+    if (email) {
+      // Update plan based on subscription status
+      const plan = (status === "active" || status === "trialing") ? "starter" : null;
+      if (plan) {
+        await c.env.DB.prepare("UPDATE users SET plan = ? WHERE email = ?").bind(plan, email).run().catch(() => {});
+      }
+      // Apply referral credit when user becomes active
+      if (status === "active") {
+        const paidUser = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first<{ id: string }>();
+        if (paidUser) {
+          await applyReferralCredit(c.env.DB, paidUser.id).catch(() => {});
+        }
+      }
+    }
+  } catch { /**/ }
+  return c.json({ ok: true });
+});
+
+// ─── Settings Page ─────────────────────────────────────────────────────────────
+app.get("/settings", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.redirect("/login?next=/settings");
+
+  const pmConnected = c.req.query("pm_connected");
+  const pmError = c.req.query("pm_error");
+
+  // Load DrChrono connection status and practice name
+  const drchronoConn = await c.env.DB.prepare(
+    "SELECT credentials_encrypted FROM pm_connections WHERE user_id = ? AND system = 'drchrono'"
+  ).bind(user.user_id).first<{ credentials_encrypted: string }>();
+
+  let drchronoPracticeName = "";
+  if (drchronoConn) {
+    try {
+      const creds = await decryptCredentials(drchronoConn.credentials_encrypted, c.env.PM_ENCRYPTION_KEY) as { practice_name?: string };
+      drchronoPracticeName = creds?.practice_name || "";
+    } catch { /* ignore decryption failure */ }
+  }
+
+  const drchronoConfigured = !!(c.env.DRCHRONO_CLIENT_ID && c.env.DRCHRONO_CLIENT_SECRET);
+  const canConnectPm = await userCanConnectPm(c.env.DB, user.user_id);
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Settings — ClinicOS AI</title>
+  <link rel="icon" href="/favicon.ico"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8fafc;color:#0f172a;min-height:100vh}
+    .page-wrap{max-width:800px;margin:0 auto;padding:2rem 1.5rem}
+    h1{font-size:1.75rem;font-weight:800;color:#0f172a;margin-bottom:.25rem}
+    .sub{color:#64748b;font-size:.95rem;margin-bottom:2rem}
+    .card{background:#fff;border:1.5px solid #e2e8f0;border-radius:12px;padding:1.5rem;margin-bottom:1.5rem}
+    .card h2{font-size:1.05rem;font-weight:700;color:#0f172a;margin-bottom:1rem;padding-bottom:.75rem;border-bottom:1px solid #f1f5f9}
+    .alert{border-radius:8px;padding:.75rem 1rem;margin-bottom:1.25rem;font-size:.9rem;font-weight:600}
+    .alert-success{background:#f0fdf4;border:1px solid #86efac;color:#166534}
+    .alert-error{background:#fef2f2;border:1px solid #fca5a5;color:#dc2626}
+    .alert-info{background:#eff6ff;border:1px solid #93c5fd;color:#1e40af}
+    .ehr-row{display:flex;align-items:center;gap:1rem;padding:1rem;border:1.5px solid #e2e8f0;border-radius:10px;background:#fff}
+    .ehr-row.connected{border-color:#86efac;background:#f0fdf4}
+    .ehr-logo{width:40px;height:40px;border-radius:8px;background:linear-gradient(135deg,#8b5cf6,#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:.85rem;flex-shrink:0}
+    .ehr-info{flex:1;min-width:0}
+    .ehr-name{font-weight:700;color:#0f172a;font-size:.95rem}
+    .ehr-sub{color:#64748b;font-size:.8rem;margin-top:.1rem}
+    .badge-connected{display:inline-flex;align-items:center;gap:.3rem;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:20px;padding:.2rem .7rem;font-size:.72rem;font-weight:700}
+    .btn{display:inline-block;padding:.55rem 1.1rem;border-radius:8px;font-weight:700;font-size:.85rem;cursor:pointer;border:none;text-decoration:none;transition:opacity .15s}
+    .btn:hover{opacity:.85}
+    .btn-primary{background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff}
+    .btn-danger{background:#fee2e2;color:#dc2626;border:1px solid #fca5a5}
+    .btn-secondary{background:#f1f5f9;color:#374151;border:1px solid #e2e8f0}
+    .upgrade-cta{background:#faf5ff;border:1.5px solid #ddd6fe;border-radius:10px;padding:1rem;text-align:center;margin-top:1rem}
+    .upgrade-cta p{color:#6d28d9;font-size:.88rem;margin-bottom:.6rem}
+    nav{background:#0f172a;padding:1rem 1.5rem;display:flex;align-items:center;gap:1.5rem}
+    nav a{color:#94a3b8;text-decoration:none;font-size:.9rem;font-weight:500}
+    nav a:hover,nav a.active{color:#fff}
+    nav .brand{color:#fff;font-weight:800;font-size:1.1rem;margin-right:auto}
+  </style>
+</head>
+<body>
+${buildNav(user)}
+<div class="page-wrap">
+  <h1>⚙️ Settings</h1>
+  <p class="sub">Manage your account connections and preferences</p>
+
+  ${pmConnected === 'drchrono' ? '<div class="alert alert-success">✅ DrChrono connected successfully! You can now import claims on the <a href="/scrubber" style="color:#166534;font-weight:700">Claim Scrubber</a> page.</div>' : ''}
+  ${pmError === 'drchrono_not_configured' ? '<div class="alert alert-error">DrChrono integration is not configured. Please contact support to enable it.</div>' : ''}
+  ${pmError === 'drchrono_token_failed' ? '<div class="alert alert-error">DrChrono authorization failed. Please try again.</div>' : ''}
+  ${pmError === 'drchrono_denied' ? '<div class="alert alert-error">DrChrono authorization was denied. Please try again if this was a mistake.</div>' : ''}
+  ${pmError === 'upgrade' ? '<div class="alert alert-info">EHR connections require a Growth or Professional plan. <a href="/pricing" style="color:#1e40af;font-weight:700">Upgrade here</a>.</div>' : ''}
+
+  <!-- Connected EHR Systems -->
+  <div class="card">
+    <h2>🔗 Connected EHR Systems</h2>
+    <p style="color:#64748b;font-size:.88rem;margin-bottom:1.25rem">Connect your EHR or practice management system to import claims directly into the scrubber — no CSV export needed.</p>
+
+    <div class="ehr-row ${drchronoConn ? 'connected' : ''}" style="margin-bottom:.75rem">
+      <div class="ehr-logo">DC</div>
+      <div class="ehr-info">
+        <div class="ehr-name">DrChrono</div>
+        <div class="ehr-sub">${drchronoConn
+          ? `Connected${drchronoPracticeName ? ' · ' + drchronoPracticeName : ''}`
+          : 'OAuth 2.0 · patients:read, clinical:read'
+        }</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:.6rem;flex-shrink:0">
+        ${drchronoConn
+          ? `<span class="badge-connected">✓ Connected</span>
+             <button class="btn btn-danger" onclick="disconnectEhr('drchrono', this)">Disconnect</button>`
+          : !drchronoConfigured
+            ? `<span style="background:#f1f5f9;color:#94a3b8;border-radius:20px;padding:.2rem .8rem;font-size:.78rem;font-weight:600">Not configured</span>`
+            : !canConnectPm
+              ? `<a href="/pricing" class="btn btn-primary">Upgrade to Connect</a>`
+              : `<a href="/api/pm/drchrono/connect" class="btn btn-primary">Connect DrChrono</a>`
+        }
+      </div>
+    </div>
+
+    ${!drchronoConfigured ? '<div class="alert alert-info" style="font-size:.83rem;font-weight:400">DrChrono integration is not yet configured. <strong>ACTION REQUIRED:</strong> Set <code>DRCHRONO_CLIENT_ID</code> and <code>DRCHRONO_CLIENT_SECRET</code> environment variables in the Cloudflare Workers dashboard.</div>' : ''}
+  </div>
+
+  <!-- Account Settings quick links -->
+  <div class="card">
+    <h2>🧭 Quick Links</h2>
+    <div style="display:flex;flex-wrap:wrap;gap:.6rem">
+      <a href="/settings/referral" class="btn btn-secondary">🎁 Refer &amp; Earn</a>
+      <a href="/settings/team" class="btn btn-secondary">👥 Team Members</a>
+      <a href="/settings/rules" class="btn btn-secondary">🛡 Custom Rules</a>
+      <a href="/pricing" class="btn btn-secondary">💳 Plans &amp; Billing</a>
+      <a href="/scrubber" class="btn btn-secondary">⚕️ Claim Scrubber</a>
+    </div>
+  </div>
+</div>
+
+<script>
+async function disconnectEhr(system, btn) {
+  if (!confirm('Disconnect ' + (system === 'drchrono' ? 'DrChrono' : system) + '? You can reconnect at any time.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Disconnecting…';
+  try {
+    const r = await fetch('/api/pm/disconnect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ system }),
+    });
+    if (r.ok) {
+      window.location.reload();
+    } else {
+      alert('Failed to disconnect. Please try again.');
+      btn.disabled = false;
+      btn.textContent = 'Disconnect';
+    }
+  } catch {
+    alert('Network error. Please try again.');
+    btn.disabled = false;
+    btn.textContent = 'Disconnect';
+  }
+}
+</script>
+</body>
+</html>`;
+  return c.html(html);
+});
+
+// ─── Referral Page ─────────────────────────────────────────────────────────────
+app.get("/settings/referral", async (c) => {
+  const user = await getCurrentUser(c);
+  if (!user) return c.redirect("/login?next=/settings/referral");
+
+  const refCode = await getOrCreateReferralCode(c.env.DB, user.user_id);
+  const refLink = `https://clinicosal.launchyard.app/?ref=${refCode}`;
+
+  // Stats
+  const totalSent = await c.env.DB.prepare("SELECT COUNT(*) as n FROM referral_credits WHERE referrer_user_id = ?").bind(user.user_id).first<{ n: number }>();
+  const totalConverted = await c.env.DB.prepare("SELECT COUNT(*) as n FROM referral_credits WHERE referrer_user_id = ? AND credited_at IS NOT NULL").bind(user.user_id).first<{ n: number }>();
+  const totalMonths = totalConverted?.n ?? 0;
+
+  // Referral rows
+  type ReferralRow = { email: string; signed_up: number; plan: string | null; credited_at: number | null };
+  const rows = await c.env.DB.prepare(`
+    SELECT u.email, u.created_at as signed_up, u.plan, rc.credited_at
+    FROM referral_credits rc
+    JOIN users u ON u.id = rc.referred_user_id
+    WHERE rc.referrer_user_id = ?
+    ORDER BY rc.created_at DESC
+  `).bind(user.user_id).all<ReferralRow>();
+
+  function maskEmail(e: string): string {
+    const [local, domain] = e.split("@");
+    if (!domain) return e;
+    return local[0] + "***@" + domain;
+  }
+  function fmtDate(ts: number): string {
+    return new Date(ts * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  }
+  function statusBadge(plan: string | null): string {
+    if (plan === "starter" || plan === "growth" || plan === "professional" || plan === "pro") {
+      return `<span class="badge badge-paid">Paid</span>`;
+    } else if (plan === "churned" || plan === "canceled") {
+      return `<span class="badge badge-churned">Churned</span>`;
+    } else {
+      return `<span class="badge badge-trial">Trial</span>`;
+    }
+  }
+
+  const tableRows = rows.results.length === 0
+    ? `<tr><td colspan="4" class="empty-state">No referrals yet — share your link to get started</td></tr>`
+    : rows.results.map(r => `<tr>
+        <td>${escHtml(maskEmail(r.email))}</td>
+        <td>${fmtDate(r.signed_up)}</td>
+        <td>${statusBadge(r.plan)}</td>
+        <td>${r.credited_at ? '<span class="credit-yes">Yes</span>' : '<span class="credit-pending">Pending</span>'}</td>
+      </tr>`).join("");
+
+  const emailSubject = encodeURIComponent("I've been using ClinicOS AI for claim scrubbing — thought you'd find it useful");
+  const emailBody = encodeURIComponent(`Hi,\n\nI've been using ClinicOS AI to catch claim errors before submission and it's been a game-changer for our billing workflow.\n\nThought you might find it useful too — here's my referral link:\n${refLink}\n\nWhen you start a paid plan, we both get one free month added automatically.\n\nBest,\n${escHtml(user.email)}`);
+  const linkedinText = encodeURIComponent(`I've been using ClinicOS AI for AI-powered medical claim scrubbing and it's been fantastic for catching denials before they happen. If you're in healthcare billing, check it out: ${refLink}`);
+
+  const nav = buildNav(user);
+  return c.html(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Refer &amp; Earn &#x2014; ClinicOS AI</title>
+<style>
+${SHARED_STYLES}
+.ref-wrap{max-width:800px;margin:0 auto;padding:2.5rem 1.5rem 4rem}
+.ref-hero{background:linear-gradient(135deg,#0f172a 0%,#0d2144 100%);color:#fff;padding:2.5rem 2rem;margin-bottom:2rem;border-radius:16px}
+.ref-hero h1{font-size:2rem;font-weight:800;margin-bottom:.4rem}
+.ref-hero p{color:rgba(255,255,255,.75);font-size:.95rem}
+.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:2rem}
+@media(max-width:600px){.stats-row{grid-template-columns:1fr}}
+.stat-card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:1.25rem 1.5rem;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+.stat-card .stat-val{font-size:2rem;font-weight:800;color:#0284c7}
+.stat-card .stat-lbl{font-size:.8rem;color:#64748b;margin-top:.25rem;font-weight:500}
+.ref-card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;margin-bottom:1.5rem;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+.ref-card h2{font-size:1rem;font-weight:700;color:#0f172a;margin-bottom:1rem}
+.link-row{display:flex;gap:.5rem;align-items:center}
+.link-row input{flex:1;padding:.65rem 1rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.9rem;color:#334155;background:#f8fafc;font-family:monospace}
+.btn-copy{padding:.65rem 1.25rem;background:#0284c7;color:#fff;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;transition:background .2s;white-space:nowrap}
+.btn-copy:hover{background:#0369a1}
+.share-row{display:flex;gap:.75rem;margin-top:1rem;flex-wrap:wrap}
+.btn-share{padding:.6rem 1.1rem;border-radius:8px;font-size:.88rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:.4rem;border:1.5px solid #e2e8f0;color:#334155;background:#fff;transition:background .2s}
+.btn-share:hover{background:#f1f5f9}
+.ref-note{background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;padding:1rem 1.25rem;color:#0369a1;font-size:.9rem;margin-bottom:1.5rem}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th{text-align:left;padding:.6rem 1rem;background:#f8fafc;color:#64748b;font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e2e8f0}
+td{padding:.75rem 1rem;border-bottom:1px solid #f1f5f9;color:#334155}
+.empty-state{text-align:center;color:#94a3b8;padding:2.5rem;font-size:.95rem}
+.badge{display:inline-block;padding:.2rem .6rem;border-radius:9999px;font-size:.75rem;font-weight:700;letter-spacing:.03em}
+.badge-paid{background:#dcfce7;color:#15803d}
+.badge-trial{background:#dbeafe;color:#1d4ed8}
+.badge-churned{background:#f1f5f9;color:#64748b}
+.credit-yes{color:#15803d;font-weight:600}
+.credit-pending{color:#94a3b8;font-size:.85rem}
+</style>
+</head>
+<body>
+${nav}
+<div class="ref-wrap">
+  <div class="ref-hero">
+    <h1>&#x1F381; Refer &amp; Earn</h1>
+    <p>Invite a colleague. When they start a paid plan, you both get one free month.</p>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-val">${totalSent?.n ?? 0}</div>
+      <div class="stat-lbl">Total Referrals Sent</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val">${totalMonths}</div>
+      <div class="stat-lbl">Total Converted to Paid</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val">${totalMonths}</div>
+      <div class="stat-lbl">Total Free Months Earned</div>
+    </div>
+  </div>
+
+  <div class="ref-card">
+    <h2>&#x1F517; Your Referral Link</h2>
+    <div class="link-row">
+      <input type="text" id="refLink" value="${escHtml(refLink)}" readonly onclick="this.select()">
+      <button class="btn-copy" id="copyBtn" onclick="copyLink()">Copy Link</button>
+    </div>
+    <div class="share-row">
+      <a class="btn-share" href="mailto:?subject=${emailSubject}&body=${emailBody}">&#x2709;&#xFE0F; Share via Email</a>
+      <a class="btn-share" href="https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(refLink)}&summary=${linkedinText}" target="_blank" rel="noopener">&#x1F4BC; Share on LinkedIn</a>
+    </div>
+  </div>
+
+  <div class="ref-note">
+    &#x2139;&#xFE0F; Share this link with a colleague. When they start a paid plan, you both get one free month added to your account automatically.
+  </div>
+
+  <div class="ref-card">
+    <h2>&#x1F4CA; Your Referrals</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Colleague</th>
+          <th>Signed Up</th>
+          <th>Status</th>
+          <th>Free Month Credited</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${tableRows}
+      </tbody>
+    </table>
+  </div>
+</div>
+${FOOTER}
+<script>
+function copyLink() {
+  const input = document.getElementById('refLink');
+  const btn = document.getElementById('copyBtn');
+  navigator.clipboard.writeText(input.value).then(function() {
+    btn.textContent = 'Copied!';
+    btn.style.background = '#15803d';
+    setTimeout(function() { btn.textContent = 'Copy Link'; btn.style.background = ''; }, 2000);
+  }).catch(function() {
+    input.select();
+    document.execCommand('copy');
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy Link'; }, 2000);
+  });
+}
+</script>
+<script>navigator.sendBeacon("/api/_ping");</script>
+</body>
+</html>`);
+});
+
 app.get("/settings/team", async (c) => {
   const user = await getCurrentUser(c);
   if (!user) return c.redirect("/login?next=/settings/team");
@@ -5411,18 +6205,18 @@ ${FOOTER}</body></html>`);
         const sevClass = r.severity === "High" ? "sev-badge-custom-high" : r.severity === "Low" ? "sev-badge-custom-low" : "sev-badge-custom-medium";
         const canManage = !isReadOnly(user);
         return `<tr>
-          <td class="rule-name-cell">${escHtml(r.name)}</td>
+          <td class="rule-name-cell">${escH(r.name)}</td>
           <td>${escHtml(payerLabel)}</td>
-          <td class="rule-cond-cell">${escHtml(condLabel)} <strong>${escHtml(r.condition_value)}</strong></td>
-          <td><span class="${sevClass}">${escHtml(r.severity)}</span></td>
+          <td class="rule-cond-cell">${escHtml(condLabel)} <strong>${escH(r.condition_value)}</strong></td>
+          <td><span class="${sevClass}">${escH(r.severity)}</span></td>
           <td>
             ${canManage ? `<label class="rule-toggle" title="${r.is_active ? "Disable rule" : "Enable rule"}">
-              <input type="checkbox" ${r.is_active ? "checked" : ""} onchange="toggleRule('${escHtml(r.id)}',this.checked)">
+              <input type="checkbox" ${r.is_active ? "checked" : ""} onchange="toggleRule('${escH(r.id)}',this.checked)">
               <span class="rule-toggle-slider"></span>
             </label>` : `<span style="color:#94a3b8;font-size:.82rem">${r.is_active ? "On" : "Off"}</span>`}
           </td>
           <td>
-            ${canManage ? `<button class="rule-delete-btn" onclick="deleteRule('${escHtml(r.id)}','${escHtml(r.name).replace(/'/g, "\\'")}')">&#x1F5D1; Delete</button>` : "—"}
+            ${canManage ? `<button class="rule-delete-btn" onclick="deleteRule('${escH(r.id)}','${escHtml(r.name).replace(/'/g, "\\'")}')">&#x1F5D1; Delete</button>` : "—"}
           </td>
         </tr>`;
       }).join("");
@@ -5826,7 +6620,7 @@ ${buildNav(user)}
     </div>
     <div class="faq-item">
       <h4>What EHR and PM systems do you integrate with?</h4>
-      <p>Growth and Professional plans include direct import from Kareo/Tebra and AdvancedMD today. DrChrono integration is coming soon. All plans accept manual CSV upload.</p>
+      <p>Growth and Professional plans include direct import from Kareo/Tebra, AdvancedMD, and DrChrono. Connect them from your Settings page. All plans accept manual CSV upload.</p>
     </div>
     <div class="faq-item">
       <h4>What counts as a "denial code" for the appeal generator?</h4>
@@ -5852,8 +6646,984 @@ ${FOOTER}
 });
 
 // ─── Sitemap & Robots ─────────────────────────────────────────────────────────
+// ─── Legal Pages ────────────────────────────────────────────────────────────
+
+const LEGAL_STYLES = `
+.legal-page{max-width:860px;margin:0 auto;padding:3rem 2rem 5rem}
+.legal-page h1{font-size:2.2rem;font-weight:800;color:var(--navy);margin-bottom:.5rem}
+.legal-meta{color:var(--gray-dark);font-size:.95rem;margin-bottom:3rem;padding-bottom:1.5rem;border-bottom:2px solid #e2e8f0}
+.legal-toc{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem 2rem;margin-bottom:3rem}
+.legal-toc h3{font-size:1rem;font-weight:700;color:var(--navy);margin-bottom:.75rem;text-transform:uppercase;letter-spacing:.05em}
+.legal-toc ol{padding-left:1.25rem;color:var(--electric-blue)}
+.legal-toc ol li{margin-bottom:.35rem;font-size:.9rem}
+.legal-toc ol li a{color:var(--electric-blue);text-decoration:none;font-weight:500}
+.legal-toc ol li a:hover{text-decoration:underline}
+.legal-section{margin-bottom:2.5rem}
+.legal-section h2{font-size:1.25rem;font-weight:700;color:var(--navy);margin-bottom:.75rem;padding-top:.5rem;border-top:1px solid #e2e8f0;padding-top:1.5rem}
+.legal-section p{margin-bottom:.9rem;line-height:1.75;color:#334155}
+.legal-section ul,.legal-section ol{padding-left:1.5rem;margin-bottom:.9rem}
+.legal-section ul li,.legal-section ol li{margin-bottom:.4rem;line-height:1.7;color:#334155}
+.legal-badge{display:inline-block;background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));color:#fff;font-size:.8rem;font-weight:700;padding:.2rem .7rem;border-radius:20px;margin-right:.5rem;vertical-align:middle}
+.back-to-top{position:fixed;bottom:2rem;right:2rem;background:var(--electric-blue);color:#fff;border:none;border-radius:50%;width:44px;height:44px;font-size:1.2rem;cursor:pointer;display:flex;align-items:center;justify-content:center;text-decoration:none;box-shadow:0 4px 12px rgba(2,132,199,.4);transition:transform .2s}
+.back-to-top:hover{transform:translateY(-3px)}
+.legal-nav{display:flex;gap:1rem;margin-bottom:2rem;flex-wrap:wrap}
+.legal-nav a{padding:.4rem .9rem;border-radius:20px;font-size:.85rem;font-weight:600;text-decoration:none;border:1.5px solid var(--electric-blue);color:var(--electric-blue);transition:all .2s}
+.legal-nav a:hover,.legal-nav a.active{background:var(--electric-blue);color:#fff}
+`;
+
+function legalPage(title: string, tocItems: string[], body: string): string {
+  const nav = buildNav(null);
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>${title} — ClinicOS AI</title>
+<style>${SHARED_STYLES}${LEGAL_STYLES}</style>
+</head><body id="top">
+${nav}
+<main class="legal-page">
+  <nav class="legal-nav">
+    <a href="/terms">Terms of Service</a>
+    <a href="/privacy">Privacy Policy</a>
+    <a href="/baa">Business Associate Agreement</a>
+  </nav>
+  ${body}
+</main>
+<a href="#top" class="back-to-top" aria-label="Back to top">&#x2191;</a>
+${FOOTER}
+</body></html>`;
+}
+
+app.get("/terms", (c) => {
+  const toc = `<div class="legal-toc"><h3>Table of Contents</h3><ol>
+    <li><a href="#acceptance">Acceptance of Terms</a></li>
+    <li><a href="#description">Description of Service</a></li>
+    <li><a href="#billing">Subscription Plans and Billing</a></li>
+    <li><a href="#acceptable-use">Acceptable Use</a></li>
+    <li><a href="#accounts">User Accounts and Security</a></li>
+    <li><a href="#ip">Intellectual Property</a></li>
+    <li><a href="#warranty">Disclaimer of Warranties</a></li>
+    <li><a href="#liability">Limitation of Liability</a></li>
+    <li><a href="#indemnification">Indemnification</a></li>
+    <li><a href="#termination">Termination</a></li>
+    <li><a href="#governing-law">Governing Law</a></li>
+    <li><a href="#changes">Changes to Terms</a></li>
+    <li><a href="#contact">Contact Information</a></li>
+  </ol></div>`;
+
+  const body = `
+<h1>Terms of Service</h1>
+<p class="legal-meta">Last Updated: June 16, 2026 &nbsp;|&nbsp; ClinicOS AI, operated by AI Tech Services</p>
+${toc}
+
+<div class="legal-section" id="acceptance">
+<h2>1. Acceptance of Terms</h2>
+<p>By accessing or using ClinicOS AI ("the Service," "we," "us," or "our"), you ("User," "you," or "Covered Entity") agree to be bound by these Terms of Service ("Terms"). If you are using the Service on behalf of an organization, you represent that you have the authority to bind that organization to these Terms.</p>
+<p>If you do not agree to these Terms, you must not access or use the Service. Your continued use of the Service after any modifications to these Terms constitutes acceptance of those modifications.</p>
+</div>
+
+<div class="legal-section" id="description">
+<h2>2. Description of Service</h2>
+<p>ClinicOS AI is a Software-as-a-Service (SaaS) platform that provides AI-powered medical claim scrubbing and denial management tools for independent medical practices and healthcare organizations. The Service includes, but is not limited to:</p>
+<ul>
+  <li>Automated claim scrubbing and error detection prior to payer submission</li>
+  <li>Denial analysis, tracking, and root-cause identification</li>
+  <li>AI-generated appeal letter drafting and management</li>
+  <li>Revenue cycle analytics and reporting dashboards</li>
+  <li>Integration with practice management systems via API</li>
+  <li>Eligibility verification tools</li>
+</ul>
+<p>The Service is intended solely for use by licensed healthcare providers, their authorized billing staff, and third-party billing companies acting on behalf of licensed providers. The Service does not constitute medical, legal, or financial advice.</p>
+</div>
+
+<div class="legal-section" id="billing">
+<h2>3. Subscription Plans and Billing</h2>
+<p><strong>Available Plans:</strong></p>
+<ul>
+  <li><strong>Starter — $99/month:</strong> Core claim scrubbing and basic denial tracking for solo practices or small teams.</li>
+  <li><strong>Growth — $299/month:</strong> Advanced analytics, appeal generation, and expanded claim volume limits for growing practices.</li>
+  <li><strong>Professional — $599/month:</strong> Full platform access including API integrations, priority support, and enterprise-level claim volumes.</li>
+</ul>
+<p><strong>Free Trial:</strong> New accounts receive a 14-day free trial on the plan of their choice. No credit card is required to begin the trial. At the end of the trial period, you must provide payment information to continue using the Service. If payment is not provided, your account will be suspended.</p>
+<p><strong>Auto-Renewal:</strong> Subscriptions automatically renew at the end of each billing period (monthly or annually, as selected at signup) at the then-current subscription price unless you cancel before the renewal date.</p>
+<p><strong>Cancellation:</strong> You may cancel your subscription at any time from your account settings. Cancellation takes effect at the end of the current billing period. You will retain access to the Service through the end of the paid period. We do not provide refunds for partial billing periods, except as required by applicable law.</p>
+<p><strong>Price Changes:</strong> We reserve the right to change subscription prices with 30 days' advance written notice. Continued use of the Service after a price change constitutes acceptance of the new pricing.</p>
+<p><strong>Taxes:</strong> Prices do not include applicable taxes. You are responsible for all taxes associated with your use of the Service.</p>
+</div>
+
+<div class="legal-section" id="acceptable-use">
+<h2>4. Acceptable Use</h2>
+<p>You agree to use the Service only for lawful purposes and in accordance with these Terms. You agree not to:</p>
+<ul>
+  <li>Access or attempt to access any part of the Service through unauthorized means, including automated scripts, bots, or scrapers not expressly authorized by us</li>
+  <li>Submit, transmit, or facilitate the submission of fraudulent medical claims, false diagnoses, or any data intended to defraud payers, patients, or government healthcare programs</li>
+  <li>Reverse engineer, decompile, disassemble, or otherwise attempt to derive the source code, underlying algorithms, or trade secrets of the Service</li>
+  <li>Copy, modify, distribute, sell, or create derivative works of any part of the Service or its content</li>
+  <li>Interfere with or disrupt the integrity or performance of the Service, its servers, or networks</li>
+  <li>Circumvent any security measures or authentication systems employed by the Service</li>
+  <li>Upload, transmit, or store any malicious code, viruses, or other harmful content</li>
+  <li>Use the Service in any manner that violates HIPAA, the False Claims Act, anti-kickback statutes, or any other applicable federal, state, or local law or regulation</li>
+  <li>Allow third parties to access the Service using your account credentials</li>
+</ul>
+<p>Violation of this section may result in immediate termination of your account and may be reported to appropriate legal and regulatory authorities.</p>
+</div>
+
+<div class="legal-section" id="accounts">
+<h2>5. User Accounts and Security</h2>
+<p>You are responsible for maintaining the confidentiality of your account credentials, including your username and password. You are fully responsible for all activities that occur under your account.</p>
+<p>You agree to immediately notify us at <a href="mailto:info@clinicosai.org">info@clinicosai.org</a> if you suspect any unauthorized use of your account or any other breach of security.</p>
+<p>We reserve the right to suspend or terminate accounts that we reasonably believe have been compromised or are being used in violation of these Terms.</p>
+<p>You must provide accurate and complete information when creating your account and keep this information current. Accounts created with false information may be terminated without notice.</p>
+</div>
+
+<div class="legal-section" id="ip">
+<h2>6. Intellectual Property</h2>
+<p>The Service, including all software, algorithms, interfaces, designs, text, graphics, and content, is owned by ClinicOS AI / AI Tech Services and is protected by United States and international intellectual property laws.</p>
+<p>Subject to your compliance with these Terms and payment of applicable fees, we grant you a limited, non-exclusive, non-transferable, revocable license to access and use the Service solely for your internal business purposes.</p>
+<p>You retain ownership of all data you submit to the Service, including patient and claim data. By submitting data to the Service, you grant us a limited license to process that data solely for the purpose of providing the Service to you, as described in our Privacy Policy and Business Associate Agreement.</p>
+<p>Any feedback, suggestions, or ideas you provide about the Service may be used by us without any obligation to compensate you.</p>
+</div>
+
+<div class="legal-section" id="warranty">
+<h2>7. Disclaimer of Warranties</h2>
+<p>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.</p>
+<p>We do not warrant that the Service will be uninterrupted, error-free, or free of viruses or other harmful components. We do not warrant that the Service's claim scrubbing, denial analysis, or appeal generation outputs are complete, accurate, or will result in payment by any payer. The Service augments but does not replace the judgment of qualified billing professionals.</p>
+<p>Some jurisdictions do not allow the exclusion of implied warranties, so the above exclusion may not apply to you.</p>
+</div>
+
+<div class="legal-section" id="liability">
+<h2>8. Limitation of Liability</h2>
+<p>TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW, CLINICOS AI AND ITS OFFICERS, DIRECTORS, EMPLOYEES, AGENTS, AND LICENSORS SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, INCLUDING LOST PROFITS, LOST REVENUE, LOSS OF DATA, OR BUSINESS INTERRUPTION, ARISING FROM YOUR USE OF OR INABILITY TO USE THE SERVICE.</p>
+<p>IN NO EVENT SHALL OUR TOTAL CUMULATIVE LIABILITY TO YOU EXCEED THE AMOUNT YOU PAID TO US FOR THE SERVICE IN THE TWELVE (12) MONTHS PRECEDING THE CLAIM.</p>
+<p>These limitations apply regardless of the theory of liability (contract, tort, negligence, strict liability, or otherwise), even if we have been advised of the possibility of such damages.</p>
+</div>
+
+<div class="legal-section" id="indemnification">
+<h2>9. Indemnification</h2>
+<p>You agree to indemnify, defend, and hold harmless ClinicOS AI, AI Tech Services, and their respective officers, directors, employees, and agents from and against any claims, liabilities, damages, judgments, awards, losses, costs, expenses, or fees (including reasonable attorneys' fees) arising out of or relating to:</p>
+<ul>
+  <li>Your use of the Service in violation of these Terms</li>
+  <li>Your submission of fraudulent, inaccurate, or unlawful claim data</li>
+  <li>Your violation of any applicable law or regulation, including HIPAA</li>
+  <li>Your infringement of any third-party rights</li>
+</ul>
+</div>
+
+<div class="legal-section" id="termination">
+<h2>10. Termination</h2>
+<p>We may suspend or terminate your access to the Service at any time, with or without cause, with or without notice, including for violation of these Terms or non-payment of fees.</p>
+<p>You may terminate your account at any time by cancelling your subscription through the account settings or by contacting us at <a href="mailto:info@clinicosai.org">info@clinicosai.org</a>.</p>
+<p>Upon termination, your right to use the Service ceases immediately. We will retain and handle your data in accordance with our Privacy Policy and Business Associate Agreement. You may request export of your data within 30 days of termination.</p>
+</div>
+
+<div class="legal-section" id="governing-law">
+<h2>11. Governing Law</h2>
+<p>These Terms shall be governed by and construed in accordance with the laws of the State of Texas, without regard to its conflict of law provisions. Any legal action or proceeding arising out of or relating to these Terms shall be brought exclusively in the federal or state courts located in Texas, and you consent to the personal jurisdiction of such courts.</p>
+</div>
+
+<div class="legal-section" id="changes">
+<h2>12. Changes to Terms</h2>
+<p>We reserve the right to modify these Terms at any time. We will provide notice of material changes by posting the updated Terms on this page with a revised "Last Updated" date, and where appropriate, by sending an email notification to the address on file for your account.</p>
+<p>Your continued use of the Service after the effective date of any changes constitutes your acceptance of the updated Terms. If you do not agree to the updated Terms, you must stop using the Service and cancel your subscription.</p>
+</div>
+
+<div class="legal-section" id="contact">
+<h2>13. Contact Information</h2>
+<p>If you have questions about these Terms of Service, please contact us:</p>
+<ul>
+  <li><strong>Email:</strong> <a href="mailto:info@clinicosai.org">info@clinicosai.org</a></li>
+  <li><strong>Company:</strong> AI Tech Services / ClinicOS AI</li>
+</ul>
+</div>`;
+
+  return c.html(legalPage("Terms of Service", [], body));
+});
+
+app.get("/privacy", (c) => {
+  const toc = `<div class="legal-toc"><h3>Table of Contents</h3><ol>
+    <li><a href="#information-we-collect">Information We Collect</a></li>
+    <li><a href="#how-we-use">How We Use Your Information</a></li>
+    <li><a href="#hipaa">HIPAA Compliance</a></li>
+    <li><a href="#data-storage">Data Storage and Security</a></li>
+    <li><a href="#sharing">Who We Share Data With</a></li>
+    <li><a href="#retention">Data Retention</a></li>
+    <li><a href="#your-rights">Your Rights</a></li>
+    <li><a href="#cookies">Cookies and Analytics</a></li>
+    <li><a href="#children">Children's Privacy</a></li>
+    <li><a href="#changes">Changes to This Policy</a></li>
+    <li><a href="#contact">Contact</a></li>
+  </ol></div>`;
+
+  const body = `
+<h1>Privacy Policy</h1>
+<p class="legal-meta">Last Updated: June 16, 2026 &nbsp;|&nbsp; ClinicOS AI, operated by AI Tech Services</p>
+${toc}
+
+<div class="legal-section" id="information-we-collect">
+<h2>1. Information We Collect</h2>
+<p>We collect information you provide directly to us and information generated through your use of the Service:</p>
+<p><strong>Account Information:</strong> When you register, we collect your name, email address, practice name, billing address, National Provider Identifier (NPI), and payment information. Payment card data is processed by our payment processor and is not stored on our servers.</p>
+<p><strong>Claim Data:</strong> To provide the Service, you submit medical claim data including procedure codes (CPT/HCPCS), diagnosis codes (ICD-10), date of service, rendering provider information, payer information, and claim amounts. This data is used solely to deliver claim scrubbing and denial management services.</p>
+<p><strong>Patient Identifiers (Protected Health Information):</strong> Claim submissions may include Protected Health Information (PHI) as defined under HIPAA, including patient name, date of birth, member ID, and other identifiers. This information is handled in accordance with HIPAA and our Business Associate Agreement. See Section 3 for full details.</p>
+<p><strong>Usage Data:</strong> We automatically collect information about how you use the Service, including pages visited, features used, session duration, IP address, browser type, device identifiers, and error logs. This data is used to improve the Service and troubleshoot technical issues.</p>
+<p><strong>Communications:</strong> If you contact our support team, we retain records of that correspondence.</p>
+</div>
+
+<div class="legal-section" id="how-we-use">
+<h2>2. How We Use Your Information</h2>
+<p>We use the information we collect for the following purposes:</p>
+<ul>
+  <li>To provide, operate, and maintain the Service</li>
+  <li>To process and analyze medical claims as requested by you</li>
+  <li>To generate denial management reports and appeal recommendations</li>
+  <li>To authenticate users and maintain account security</li>
+  <li>To process billing and subscription payments</li>
+  <li>To send transactional emails (account confirmations, billing receipts, service alerts)</li>
+  <li>To respond to your support inquiries and feedback</li>
+  <li>To monitor and improve Service performance and reliability</li>
+  <li>To comply with legal obligations, including HIPAA requirements</li>
+  <li>To enforce our Terms of Service and other agreements</li>
+</ul>
+<p>We do not use PHI to train machine learning models without your explicit written consent. Aggregate, de-identified statistical data derived from claim patterns may be used to improve the Service's scrubbing algorithms, provided it cannot reasonably be used to identify any individual patient.</p>
+</div>
+
+<div class="legal-section" id="hipaa">
+<h2>3. HIPAA Compliance</h2>
+<p><span class="legal-badge">HIPAA</span><strong>ClinicOS AI acts as a Business Associate under HIPAA.</strong> When you use our Service to process claims that contain Protected Health Information, ClinicOS AI functions as a Business Associate as defined by the Health Insurance Portability and Accountability Act of 1996 (HIPAA) and the HITECH Act.</p>
+<p><strong>Business Associate Agreement:</strong> By subscribing to ClinicOS AI, you and we enter into a Business Associate Agreement (BAA). Our full BAA is available at <a href="/baa">clinicosal.launchyard.app/baa</a>. The BAA governs our respective obligations regarding PHI and takes precedence over this Privacy Policy to the extent of any conflict with respect to PHI.</p>
+<p><strong>PHI Handling:</strong> All PHI submitted to ClinicOS AI is handled in strict accordance with the HIPAA Privacy Rule (45 CFR Part 164, Subpart E) and the HIPAA Security Rule (45 CFR Part 164, Subpart C). We implement and maintain administrative, physical, and technical safeguards designed to protect the confidentiality, integrity, and availability of electronic PHI (ePHI).</p>
+<p><strong>Encryption:</strong> All PHI transmitted to and from the Service is encrypted in transit using TLS 1.2 or higher. All PHI stored within the Service is encrypted at rest using AES-256 encryption. Access to encrypted data stores is limited to authorized personnel with a legitimate need to access the data to provide the Service.</p>
+<p><strong>Permitted Uses:</strong> We use and disclose PHI only as permitted or required under the BAA and HIPAA, which includes using PHI to provide the contracted services, and disclosing PHI as required by law (such as to HHS during an investigation or audit).</p>
+<p><strong>Breach Notification:</strong> In the event of a breach of unsecured PHI, we will notify you without unreasonable delay and in no case later than 60 days after discovery of the breach, as required under the HIPAA Breach Notification Rule (45 CFR Part 164, Subpart D).</p>
+</div>
+
+<div class="legal-section" id="data-storage">
+<h2>4. Data Storage and Security</h2>
+<p>Your data is stored on servers located within the United States. We use industry-standard security practices to protect your information, including:</p>
+<ul>
+  <li>Encryption of data in transit (TLS 1.2+) and at rest (AES-256)</li>
+  <li>Role-based access controls limiting employee access to customer data</li>
+  <li>Regular security assessments and vulnerability scanning</li>
+  <li>Multi-factor authentication for internal systems access</li>
+  <li>Audit logging of all access to PHI</li>
+  <li>Regular data backups with tested recovery procedures</li>
+</ul>
+<p>While we implement appropriate technical and organizational measures, no method of transmission over the Internet or method of electronic storage is 100% secure. We cannot guarantee absolute security of your information.</p>
+</div>
+
+<div class="legal-section" id="sharing">
+<h2>5. Who We Share Data With</h2>
+<p><strong>We do not sell your data.</strong> We do not sell, rent, or trade your personal information or PHI to third parties for their own marketing or commercial purposes.</p>
+<p>We may share your information with the following categories of parties, solely as necessary to deliver the Service:</p>
+<ul>
+  <li><strong>Cloud Infrastructure Providers:</strong> Hosting, storage, and database services that process data on our behalf under appropriate data processing agreements.</li>
+  <li><strong>Payment Processors:</strong> For billing and subscription management. Payment processors handle card data directly and are PCI-DSS compliant.</li>
+  <li><strong>Analytics Services:</strong> Aggregated, non-PHI usage analytics to help us understand how the Service is used.</li>
+  <li><strong>Legal and Compliance:</strong> We may disclose information if required by law, regulation, legal process, or governmental authority, including disclosures required under HIPAA.</li>
+  <li><strong>Business Transfers:</strong> In connection with a merger, acquisition, or sale of assets, your information may be transferred as part of that transaction, subject to continued compliance with applicable privacy laws.</li>
+</ul>
+<p>All subprocessors who handle PHI are required to execute a subcontractor BAA with us before receiving access to any PHI.</p>
+</div>
+
+<div class="legal-section" id="retention">
+<h2>6. Data Retention</h2>
+<p>We retain your data for the following periods:</p>
+<ul>
+  <li><strong>Claim Data (including PHI):</strong> Retained for 2 years from the date of submission, or longer if required by applicable law (including state medical records retention requirements).</li>
+  <li><strong>Account Data:</strong> Retained while your account is active and for 30 days following cancellation or termination of your subscription, during which time you may request export of your data.</li>
+  <li><strong>Usage and Log Data:</strong> Retained for up to 12 months for security and debugging purposes.</li>
+  <li><strong>Billing Records:</strong> Retained for 7 years as required by applicable tax and accounting laws.</li>
+</ul>
+<p>Following the applicable retention period, we will securely delete or de-identify your data in accordance with HIPAA and other applicable requirements. You may request earlier deletion of non-PHI account data; PHI deletion requests are subject to applicable legal retention requirements.</p>
+</div>
+
+<div class="legal-section" id="your-rights">
+<h2>7. Your Rights</h2>
+<p>Subject to applicable law, you have the following rights with respect to your personal information:</p>
+<ul>
+  <li><strong>Access:</strong> You may request a copy of the personal information we hold about you and your organization.</li>
+  <li><strong>Correction:</strong> You may request correction of inaccurate or incomplete personal information.</li>
+  <li><strong>Deletion:</strong> You may request deletion of your personal information, subject to our legal retention obligations and HIPAA requirements applicable to PHI.</li>
+  <li><strong>Data Portability:</strong> You may request an export of your claim data in a machine-readable format within 30 days of account cancellation.</li>
+  <li><strong>Objection:</strong> You may object to certain uses of your information, including marketing communications.</li>
+</ul>
+<p>To exercise these rights, please contact us at <a href="mailto:info@clinicosai.org">info@clinicosai.org</a>. We will respond to requests within 30 days. Note that certain rights may be limited where they conflict with our legal obligations, including our obligations as a HIPAA Business Associate.</p>
+</div>
+
+<div class="legal-section" id="cookies">
+<h2>8. Cookies and Analytics</h2>
+<p>We use cookies and similar tracking technologies to maintain session state (keeping you logged in), remember your preferences, and understand how the Service is used.</p>
+<p><strong>Session Cookies:</strong> Required for authentication and core Service functionality. These expire when you close your browser or log out.</p>
+<p><strong>Analytics:</strong> We use analytics tools to collect aggregated, non-PHI usage statistics to improve the Service. You may opt out of analytics tracking through your browser settings or by contacting us.</p>
+<p>We do not use third-party advertising cookies or engage in cross-site tracking for advertising purposes.</p>
+</div>
+
+<div class="legal-section" id="children">
+<h2>9. Children's Privacy</h2>
+<p>The Service is intended for use by healthcare providers and billing professionals and is not directed to individuals under the age of 18. We do not knowingly collect personal information from children. If you believe we have inadvertently collected information from a minor, please contact us immediately at <a href="mailto:info@clinicosai.org">info@clinicosai.org</a>.</p>
+</div>
+
+<div class="legal-section" id="changes">
+<h2>10. Changes to This Policy</h2>
+<p>We may update this Privacy Policy from time to time. We will notify you of material changes by posting the updated policy on this page with a revised "Last Updated" date and, where appropriate, by sending an email notification to the address on file for your account.</p>
+<p>Your continued use of the Service after the effective date of any changes constitutes your acceptance of the updated Privacy Policy.</p>
+</div>
+
+<div class="legal-section" id="contact">
+<h2>11. Contact</h2>
+<p>For questions, concerns, or requests regarding this Privacy Policy or your personal information, please contact us:</p>
+<ul>
+  <li><strong>Email:</strong> <a href="mailto:info@clinicosai.org">info@clinicosai.org</a></li>
+  <li><strong>Company:</strong> AI Tech Services / ClinicOS AI</li>
+</ul>
+<p>For HIPAA-related inquiries or to report a suspected breach, please email <a href="mailto:info@clinicosai.org">info@clinicosai.org</a> with the subject line "HIPAA Inquiry."</p>
+</div>`;
+
+  return c.html(legalPage("Privacy Policy", [], body));
+});
+
+app.get("/baa", (c) => {
+  const toc = `<div class="legal-toc"><h3>Table of Contents</h3><ol>
+    <li><a href="#definitions">Definitions</a></li>
+    <li><a href="#ba-obligations">Obligations of Business Associate (ClinicOS AI)</a></li>
+    <li><a href="#ce-obligations">Obligations of Covered Entity</a></li>
+    <li><a href="#permitted-uses">Permitted Uses and Disclosures</a></li>
+    <li><a href="#subcontractors">Subcontractors</a></li>
+    <li><a href="#breach-notification">Breach Notification</a></li>
+    <li><a href="#term-termination">Term and Termination</a></li>
+    <li><a href="#miscellaneous">Miscellaneous</a></li>
+    <li><a href="#execution">Effective Date and Execution</a></li>
+  </ol></div>`;
+
+  const body = `
+<h1>Business Associate Agreement</h1>
+<p class="legal-meta">Last Updated: June 16, 2026 &nbsp;|&nbsp; <span class="legal-badge">HIPAA</span> Between ClinicOS AI and the Subscribing Covered Entity</p>
+${toc}
+
+<div class="legal-section" id="definitions">
+<h2>1. Definitions</h2>
+<p>Unless otherwise defined herein, capitalized terms shall have the meanings given to them under HIPAA and its implementing regulations. The following definitions apply to this Business Associate Agreement ("BAA" or "Agreement"):</p>
+<ul>
+  <li><strong>"Business Associate"</strong> means ClinicOS AI, operated by AI Tech Services, which provides AI-powered claim scrubbing, denial management, and related healthcare revenue cycle services to Covered Entities.</li>
+  <li><strong>"Covered Entity"</strong> means the healthcare provider, medical practice, or healthcare organization that subscribes to ClinicOS AI and is subject to the HIPAA Privacy and Security Rules.</li>
+  <li><strong>"PHI" or "Protected Health Information"</strong> has the meaning given in 45 CFR § 160.103, and includes all individually identifiable health information transmitted or maintained in any form or medium that relates to the past, present, or future physical or mental health or condition of an individual, provision of health care, or payment for health care.</li>
+  <li><strong>"ePHI" or "Electronic Protected Health Information"</strong> means PHI that is created, received, maintained, or transmitted in electronic form.</li>
+  <li><strong>"HIPAA"</strong> means the Health Insurance Portability and Accountability Act of 1996 and all regulations promulgated thereunder, including the Privacy Rule (45 CFR Part 164, Subpart E), the Security Rule (45 CFR Part 164, Subpart C), the Breach Notification Rule (45 CFR Part 164, Subpart D), and as amended by the Health Information Technology for Economic and Clinical Health (HITECH) Act.</li>
+  <li><strong>"Services"</strong> means the claim scrubbing, denial management, appeals assistance, and related revenue cycle services provided by Business Associate to Covered Entity pursuant to the subscription agreement and these Terms of Service.</li>
+  <li><strong>"Breach"</strong> has the meaning given in 45 CFR § 164.402, meaning the acquisition, access, use, or disclosure of PHI in a manner not permitted under the HIPAA Privacy Rule that compromises the security or privacy of PHI.</li>
+  <li><strong>"Security Incident"</strong> means the attempted or successful unauthorized access, use, disclosure, modification, or destruction of ePHI or interference with system operations in an information system containing ePHI.</li>
+</ul>
+</div>
+
+<div class="legal-section" id="ba-obligations">
+<h2>2. Obligations of Business Associate (ClinicOS AI)</h2>
+<p>Business Associate agrees to:</p>
+<ul>
+  <li><strong>Permitted Uses Only:</strong> Not use or disclose PHI other than as permitted or required by this BAA or as required by applicable law. PHI will be used exclusively to provide the Services described in the subscription agreement and for the management and administration of Business Associate's own operations to the limited extent permitted by HIPAA.</li>
+  <li><strong>Appropriate Safeguards:</strong> Implement and maintain appropriate administrative, physical, and technical safeguards to protect the confidentiality, integrity, and availability of ePHI in accordance with the HIPAA Security Rule (45 CFR Part 164, Subpart C), and prevent any use or disclosure of PHI other than as provided for by this BAA.</li>
+  <li><strong>Reporting Security Incidents:</strong> Report to Covered Entity any Security Incident of which Business Associate becomes aware. The parties acknowledge and agree that this section constitutes notice that attempted but unsuccessful Security Incidents (such as pings, port scans, or unsuccessful log-on attempts) occur on a routine basis and do not require individual reporting.</li>
+  <li><strong>Reporting Breaches:</strong> Report to Covered Entity any Breach of unsecured PHI discovered by Business Associate in accordance with Section 6 of this BAA (Breach Notification), which requires notification within 60 days of discovery.</li>
+  <li><strong>Subcontractor Agreements:</strong> Ensure that any subcontractors or agents to whom Business Associate provides PHI agree in writing to the same restrictions and conditions that apply to Business Associate under this BAA, through a written subcontractor business associate agreement prior to providing access to PHI.</li>
+  <li><strong>Access to PHI:</strong> Make PHI available to Covered Entity upon request in accordance with 45 CFR § 164.524, and as necessary to enable Covered Entity to respond to individual requests for access to PHI, in a reasonable time and manner.</li>
+  <li><strong>Amendment of PHI:</strong> Make PHI available for amendment and incorporate any amendments to PHI as directed by Covered Entity in accordance with 45 CFR § 164.526.</li>
+  <li><strong>Accounting of Disclosures:</strong> Make available to Covered Entity the information required to provide an accounting of disclosures of PHI in accordance with 45 CFR § 164.528.</li>
+  <li><strong>Governmental Access:</strong> Make its internal practices, books, and records relating to the use and disclosure of PHI available to the Secretary of the Department of Health and Human Services for the purpose of determining compliance with HIPAA.</li>
+  <li><strong>Minimum Necessary:</strong> Use or disclose only the minimum amount of PHI necessary to accomplish the intended purpose of the use or disclosure.</li>
+</ul>
+</div>
+
+<div class="legal-section" id="ce-obligations">
+<h2>3. Obligations of Covered Entity</h2>
+<p>Covered Entity agrees to:</p>
+<ul>
+  <li><strong>Minimum Necessary PHI:</strong> Provide to Business Associate only the minimum PHI necessary to enable Business Associate to provide the Services. Covered Entity is responsible for ensuring that PHI transmitted to Business Associate is limited to what is reasonably needed for claim processing and related revenue cycle services.</li>
+  <li><strong>Notify of Restrictions:</strong> Notify Business Associate of any restrictions on the use or disclosure of PHI that Covered Entity has agreed to in accordance with 45 CFR § 164.522, to the extent that such restrictions may affect Business Associate's use or disclosure of PHI.</li>
+  <li><strong>Notify of Changes in Authorization:</strong> Notify Business Associate of any changes in, or revocation of, authorization by an individual to use or disclose PHI, to the extent that such changes may affect Business Associate's permitted or required uses and disclosures.</li>
+  <li><strong>Lawful Data:</strong> Not request Business Associate to use or disclose PHI in any manner that would not be permissible under HIPAA if done by Covered Entity directly.</li>
+  <li><strong>HIPAA Compliance:</strong> Ensure that its own workforce is trained on and compliant with applicable HIPAA requirements prior to and during use of the Services.</li>
+  <li><strong>Accurate Information:</strong> Provide accurate and complete information when setting up its account and when submitting claims through the Service.</li>
+</ul>
+</div>
+
+<div class="legal-section" id="permitted-uses">
+<h2>4. Permitted Uses and Disclosures</h2>
+<p>Business Associate is authorized to use and disclose PHI as follows:</p>
+<ul>
+  <li><strong>To Provide Services:</strong> Business Associate may use PHI as necessary to provide claim scrubbing, denial management, appeals assistance, and related revenue cycle services to Covered Entity under the subscription agreement.</li>
+  <li><strong>Management and Administration:</strong> Business Associate may use PHI for the proper management and administration of Business Associate, or to carry out its legal responsibilities, provided that such disclosures are required by law, or Business Associate obtains reasonable assurances that the information will remain confidential and used only for the purpose for which it was disclosed.</li>
+  <li><strong>De-identified Data:</strong> Business Associate may use PHI to create de-identified health information in accordance with 45 CFR § 164.514(b), and may use and disclose such de-identified information for any lawful purpose, including to improve the accuracy of its claim scrubbing algorithms and Service quality.</li>
+  <li><strong>Required by Law:</strong> Business Associate may use or disclose PHI as required by applicable law, including responding to valid legal process or governmental agency requests.</li>
+</ul>
+<p>Business Associate shall not use or disclose PHI for any purpose not expressly authorized in this Section 4 or as required by applicable law.</p>
+</div>
+
+<div class="legal-section" id="subcontractors">
+<h2>5. Subcontractors</h2>
+<p>Business Associate may engage subcontractors and agents who create, receive, maintain, or transmit PHI on Business Associate's behalf. Before providing a subcontractor or agent with access to PHI, Business Associate shall require the subcontractor or agent to execute a written agreement that:</p>
+<ul>
+  <li>Imposes on the subcontractor the same restrictions, conditions, and requirements regarding the use and disclosure of PHI that apply to Business Associate under this BAA</li>
+  <li>Requires the subcontractor to implement appropriate safeguards for ePHI in accordance with the HIPAA Security Rule</li>
+  <li>Requires the subcontractor to report Security Incidents and Breaches to Business Associate in a timeframe that allows Business Associate to meet its notification obligations to Covered Entity</li>
+</ul>
+<p>Business Associate remains responsible to Covered Entity for the acts and omissions of its subcontractors to the same extent as if Business Associate had performed the services directly.</p>
+</div>
+
+<div class="legal-section" id="breach-notification">
+<h2>6. Breach Notification</h2>
+<p><strong>Discovery:</strong> A Breach is treated as discovered on the first day on which the Breach is known, or by exercising reasonable diligence would have been known, to any workforce member of Business Associate.</p>
+<p><strong>Notification Timeline:</strong> Business Associate shall notify Covered Entity of a Breach of unsecured PHI without unreasonable delay and in no case later than <strong>60 calendar days</strong> after Business Associate's discovery of the Breach.</p>
+<p><strong>Notification Content:</strong> To the extent known, the notification shall include:</p>
+<ul>
+  <li>A description of the nature of the Breach, including the type of PHI involved</li>
+  <li>The identity of each individual whose PHI was, or is reasonably believed to have been, subject to the Breach</li>
+  <li>A description of what Business Associate is doing to investigate the Breach, mitigate harm, and protect against further Breaches</li>
+  <li>Contact information for individuals at Business Associate who can answer questions about the Breach</li>
+</ul>
+<p><strong>Covered Entity's Responsibility:</strong> Covered Entity is responsible for notifying affected individuals, the HHS Secretary, and, if applicable, media outlets, in accordance with the HIPAA Breach Notification Rule (45 CFR Part 164, Subpart D). Business Associate will cooperate fully with Covered Entity in meeting its notification obligations.</p>
+<p><strong>Risk Assessment:</strong> If Business Associate believes a specific acquisition, access, use, or disclosure of PHI does not constitute a Breach because it falls within an exception under 45 CFR § 164.402, Business Associate shall document and provide to Covered Entity the basis for that determination.</p>
+</div>
+
+<div class="legal-section" id="term-termination">
+<h2>7. Term and Termination</h2>
+<p><strong>Term:</strong> This BAA becomes effective upon Covered Entity's subscription to ClinicOS AI (see Section 9) and remains in effect until the subscription agreement is terminated or expires, unless earlier terminated in accordance with this section.</p>
+<p><strong>Termination for Cause:</strong> Either party may terminate this BAA if the other party materially breaches any provision of this BAA and fails to cure such breach within 30 days after receiving written notice of the breach, or if cure is not possible, immediately upon written notice.</p>
+<p><strong>Effect of Termination — Return or Destruction of PHI:</strong> Upon termination of this BAA for any reason, Business Associate shall, at Covered Entity's election:</p>
+<ul>
+  <li>Return to Covered Entity all PHI in Business Associate's possession or control within 30 days of termination; or</li>
+  <li>Destroy all PHI in Business Associate's possession or control, including all copies in any format, and certify in writing to Covered Entity that such destruction has been completed.</li>
+</ul>
+<p>If Business Associate determines that return or destruction of PHI is not feasible (for example, because PHI has been integrated into backup systems in a manner that would require destruction of non-PHI data), Business Associate shall extend the protections of this BAA to such PHI for as long as it is retained and shall limit further uses and disclosures to those purposes that make return or destruction infeasible.</p>
+<p>Business Associate will retain claim data for the period described in the Privacy Policy (generally 2 years from submission) consistent with applicable legal retention requirements, after which it will be securely destroyed.</p>
+</div>
+
+<div class="legal-section" id="miscellaneous">
+<h2>8. Miscellaneous</h2>
+<p><strong>Governing Law:</strong> This BAA shall be governed by the laws of the State of Texas and applicable federal law, including HIPAA. Any disputes arising from this BAA shall be resolved in accordance with the dispute resolution provisions of the subscription Terms of Service.</p>
+<p><strong>Entire Agreement:</strong> This BAA, together with the ClinicOS AI Terms of Service and Privacy Policy, constitutes the entire agreement between the parties with respect to the privacy and security of PHI and supersedes all prior agreements and understandings relating to the same subject matter.</p>
+<p><strong>Amendments:</strong> This BAA may be amended only by a written instrument signed by authorized representatives of both parties, or as necessary to comply with changes in HIPAA or other applicable law. Business Associate reserves the right to amend this BAA by providing 30 days' advance written notice to Covered Entity. Continued use of the Service after such notice constitutes acceptance of the amended BAA.</p>
+<p><strong>No Third-Party Beneficiaries:</strong> This BAA is for the sole benefit of the parties and their respective successors and permitted assigns. Nothing in this BAA shall create any third-party beneficiary rights.</p>
+<p><strong>Survival:</strong> The provisions of this BAA regarding confidentiality, safeguards, breach notification, and the obligations applicable to PHI retained after termination shall survive the termination of this BAA.</p>
+<p><strong>Regulatory References:</strong> Any reference to a regulatory provision includes any amendment or successor provision to such provision.</p>
+<p><strong>Indemnification:</strong> Each party shall be responsible for its own compliance with HIPAA and shall indemnify, defend, and hold harmless the other party from any claims, liabilities, or penalties arising from the indemnifying party's failure to comply with this BAA or applicable law.</p>
+</div>
+
+<div class="legal-section" id="execution">
+<h2>9. Effective Date and Execution</h2>
+<p><strong>Electronic Acceptance:</strong> By subscribing to ClinicOS AI and using the Service to process PHI, the Covered Entity agrees to the terms of this Business Associate Agreement. This electronic acceptance is legally binding and constitutes the execution of this BAA by Covered Entity.</p>
+<p><strong>Effective Date:</strong> This BAA is effective as of the date Covered Entity first subscribes to or uses ClinicOS AI, and remains in effect as described in Section 7.</p>
+<p><strong>Authority:</strong> The individual who subscribes on behalf of a Covered Entity represents and warrants that they have the legal authority to bind the Covered Entity to the terms of this BAA.</p>
+<p><strong>Record of Agreement:</strong> ClinicOS AI maintains records of subscription acceptance as evidence of the execution of this BAA. If you require a countersigned physical copy of this BAA, please contact us at <a href="mailto:info@clinicosai.org">info@clinicosai.org</a>.</p>
+<hr style="margin:2rem 0;border:none;border-top:2px solid #e2e8f0">
+<p style="text-align:center;color:var(--gray-dark);font-size:.95rem"><strong>Business Associate:</strong> ClinicOS AI / AI Tech Services &nbsp;|&nbsp; <strong>Covered Entity:</strong> Subscribing healthcare provider (accepted electronically at signup)</p>
+</div>`;
+
+  return c.html(legalPage("Business Associate Agreement", [], body));
+});
+
+// ─── Blog ─────────────────────────────────────────────────────────────────────
+
+const BLOG_BASE_STYLE = `
+<style>
+.blog-hero{text-align:center;padding:4rem 2rem 2rem;background:linear-gradient(135deg,#f8fafc,#e0f2fe)}
+.blog-hero h1{font-size:2.8rem;font-weight:800;color:var(--navy);margin-bottom:1rem;line-height:1.2}
+.blog-hero p{font-size:1.15rem;color:var(--gray-dark);max-width:600px;margin:0 auto}
+.blog-grid{max-width:1100px;margin:0 auto;padding:3rem 2rem 5rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:2rem}
+.blog-card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:2rem;text-decoration:none;color:inherit;transition:box-shadow .2s,transform .2s;display:flex;flex-direction:column;gap:.75rem}
+.blog-card:hover{box-shadow:0 8px 32px rgba(2,132,199,.12);transform:translateY(-2px)}
+.blog-card-meta{font-size:.82rem;color:var(--gray-dark);display:flex;gap:1rem}
+.blog-card h2{font-size:1.3rem;font-weight:700;color:var(--navy);line-height:1.35;margin:0}
+.blog-card p{font-size:.97rem;color:#475569;line-height:1.65;margin:0;flex:1}
+.blog-card-cta{font-size:.9rem;font-weight:600;color:var(--electric-blue);margin-top:.5rem}
+.article-hero{background:linear-gradient(135deg,#f8fafc,#e0f2fe);padding:4rem 2rem 3rem;text-align:center}
+.article-hero h1{font-size:2.4rem;font-weight:800;color:var(--navy);max-width:780px;margin:0 auto 1rem;line-height:1.25}
+.article-meta{font-size:.9rem;color:var(--gray-dark);display:flex;gap:1.5rem;justify-content:center;flex-wrap:wrap}
+.article-body{max-width:780px;margin:0 auto;padding:2.5rem 2rem 4rem;font-size:1.05rem;line-height:1.8;color:#334155}
+.article-body h2{font-size:1.65rem;font-weight:700;color:var(--navy);margin:2.5rem 0 1rem;line-height:1.3}
+.article-body h3{font-size:1.2rem;font-weight:700;color:var(--navy);margin:1.75rem 0 .75rem}
+.article-body p{margin:0 0 1.25rem}
+.article-body ul,.article-body ol{margin:0 0 1.25rem 1.5rem}
+.article-body li{margin-bottom:.5rem}
+.article-body strong{color:var(--navy)}
+.article-cta{background:linear-gradient(135deg,var(--navy),var(--navy-light));color:#fff;text-align:center;padding:3.5rem 2rem;margin-top:3rem;border-radius:16px}
+.article-cta h3{font-size:1.6rem;font-weight:700;margin-bottom:.75rem}
+.article-cta p{font-size:1.05rem;opacity:.85;margin-bottom:1.75rem}
+.article-cta .cta-btn{display:inline-block;background:#fff;color:var(--navy);font-weight:700;padding:.9rem 2.2rem;border-radius:8px;text-decoration:none;font-size:1rem;transition:transform .2s}
+.article-cta .cta-btn:hover{transform:translateY(-2px)}
+.breadcrumb{font-size:.88rem;color:var(--gray-dark);max-width:780px;margin:1.5rem auto 0;padding:0 2rem}
+.breadcrumb a{color:var(--electric-blue);text-decoration:none}
+.checklist{list-style:none;margin:0 0 1.25rem;padding:0}
+.checklist li{padding:.55rem .75rem .55rem 2.2rem;position:relative;border-radius:6px;margin-bottom:.4rem;background:#f8fafc}
+.checklist li::before{content:"\\2713";position:absolute;left:.7rem;color:#10b981;font-weight:700}
+</style>`;
+
+function blogPage(title: string, meta: { description: string; canonical: string }, content: string, nav: string): string {
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta name="description" content="${meta.description}">
+<link rel="canonical" href="${meta.canonical}">
+<style>:root{--navy:#0f172a;--navy-light:#1a2a47;--electric-blue:#0284c7;--electric-teal:#06b6d4;--white:#fff;--gray-light:#f8fafc;--gray-dark:#64748b;--success:#10b981}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#334155;background:#fff}
+nav{background:#fff;border-bottom:1px solid #e2e8f0;position:sticky;top:0;z-index:1000}
+.nav-container{max-width:1200px;margin:0 auto;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
+.logo{display:flex;align-items:center;gap:.5rem;font-size:1.5rem;font-weight:700;color:var(--navy);text-decoration:none}
+.logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1rem}
+.nav-links{display:flex;gap:1.5rem;list-style:none;align-items:center}
+.nav-links a{text-decoration:none;color:var(--gray-dark);font-weight:500;transition:color .3s ease}
+.nav-links a:hover{color:var(--electric-blue)}
+.nav-cta{background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));color:#fff;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:600}
+footer{background:var(--navy);color:#fff;padding:3rem 2rem 1.5rem;margin-top:5rem}
+.footer-inner{max-width:1200px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr 1fr;gap:3rem}
+.footer-bottom{max-width:1200px;margin:2rem auto 0;padding-top:1.5rem;border-top:1px solid rgba(255,255,255,.1);display:flex;justify-content:space-between;align-items:center;font-size:.85rem;color:rgba(255,255,255,.6)}
+.footer-bottom a{color:rgba(255,255,255,.6);text-decoration:none}.footer-bottom a:hover{color:#fff}
+@media(max-width:768px){.nav-links{display:none}.footer-inner{grid-template-columns:1fr}}
+</style>
+${BLOG_BASE_STYLE}
+</head><body>
+${nav}
+${content}
+<footer>
+  <div class="footer-inner">
+    <div><div style="display:flex;align-items:center;gap:.5rem;margin-bottom:1rem"><div class="logo-icon">&#x26A1;</div><span style="font-size:1.3rem;font-weight:700">ClinicOS AI</span></div><p style="color:rgba(255,255,255,.7);font-size:.9rem;line-height:1.6">AI-powered medical billing for independent clinics. Reduce denials, get paid faster.</p></div>
+    <div><h4 style="margin-bottom:1rem;font-size:.9rem;text-transform:uppercase;letter-spacing:.05em;color:rgba(255,255,255,.5)">Product</h4><div style="display:flex;flex-direction:column;gap:.75rem"><a href="/scrubber" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Claim Scrubber</a><a href="/denial-tracker" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Denial Tracker</a><a href="/eligibility" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Eligibility Check</a><a href="/pricing" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Pricing</a></div></div>
+    <div><h4 style="margin-bottom:1rem;font-size:.9rem;text-transform:uppercase;letter-spacing:.05em;color:rgba(255,255,255,.5)">Resources</h4><div style="display:flex;flex-direction:column;gap:.75rem"><a href="/blog" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Blog</a><a href="/terms" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Terms</a><a href="/privacy" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Privacy</a><a href="/contact" style="color:rgba(255,255,255,.7);text-decoration:none;font-size:.9rem">Contact</a></div></div>
+  </div>
+  <div class="footer-bottom"><span>&copy; 2026 ClinicOS AI. All rights reserved.</span><span>Made with &#x2764;&#xFE0F; using <a href="https://launchyard.dev">Launchyard</a></span></div>
+</footer>
+</body></html>`;
+}
+
+// ─── Contact Page ──────────────────────────────────────────────────────────────
+
+function contactPageHtml(nav: string, submitted: boolean, error: string): string {
+  const confirmBanner = submitted
+    ? `<div class="contact-confirm" role="alert">&#x2705; Thanks — we'll get back to you within 1 business day.</div>`
+    : '';
+  const errorBanner = error
+    ? `<div class="contact-error" role="alert">&#x26A0;&#xFE0F; ${escHtml(error)}</div>`
+    : '';
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contact Us | ClinicOS AI</title>
+<meta name="description" content="Get in touch with the ClinicOS AI team for billing questions, technical support, or partnership inquiries.">
+<style>
+:root{--navy:#0f172a;--navy-light:#1a2a47;--electric-blue:#0284c7;--electric-teal:#06b6d4;--white:#fff;--gray-light:#f8fafc;--gray-dark:#64748b;--success:#10b981}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;color:#1e293b;line-height:1.6}
+nav{background:#fff;border-bottom:1px solid #e2e8f0;position:sticky;top:0;z-index:1000}
+.nav-container{max-width:1200px;margin:0 auto;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
+.logo{display:flex;align-items:center;gap:.5rem;font-size:1.5rem;font-weight:700;color:var(--navy);text-decoration:none}
+.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.2rem}
+.nav-links{display:flex;gap:2rem;list-style:none;align-items:center}
+.nav-links a{text-decoration:none;color:var(--gray-dark);font-weight:500;transition:color .3s}
+.nav-links a:hover{color:var(--electric-blue)}
+.nav-link-highlight{color:var(--electric-blue)!important;font-weight:700!important}
+.nav-cta{background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));color:#fff;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:600}
+@media(max-width:768px){.nav-links{display:none}}
+.contact-wrap{max-width:700px;margin:3rem auto;padding:0 1.5rem}
+.contact-wrap h1{font-size:2.2rem;font-weight:800;color:var(--navy);margin-bottom:.75rem}
+.contact-intro{color:var(--gray-dark);font-size:1.05rem;margin-bottom:1.5rem;line-height:1.7}
+.contact-email-row{display:flex;align-items:center;gap:.5rem;margin-bottom:2rem;font-size:1rem}
+.contact-email-row a{color:var(--electric-blue);font-weight:600;text-decoration:none}
+.contact-email-row a:hover{text-decoration:underline}
+.contact-card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:2rem;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.contact-confirm{background:#d1fae5;border:1px solid #6ee7b7;color:#065f46;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.5rem;font-weight:500}
+.contact-error{background:#fee2e2;border:1px solid #fca5a5;color:#991b1b;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.5rem;font-weight:500}
+.form-group{margin-bottom:1.25rem}
+.form-group label{display:block;font-weight:600;font-size:.9rem;color:var(--navy);margin-bottom:.4rem}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:.7rem 1rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:1rem;font-family:inherit;color:#1e293b;background:#fff;transition:border-color .2s}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:var(--electric-blue)}
+.form-group textarea{resize:vertical;min-height:130px}
+.btn-submit{background:linear-gradient(135deg,var(--electric-blue),var(--electric-teal));color:#fff;padding:.8rem 2rem;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;transition:opacity .2s}
+.btn-submit:hover{opacity:.9}
+footer{background:var(--navy);color:#fff;padding:3rem 2rem 1.5rem;margin-top:5rem}
+.footer-container{max-width:1200px;margin:0 auto;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:2rem;margin-bottom:2rem}
+.footer-section h4{font-size:1rem;font-weight:700;margin-bottom:1rem}
+.footer-section a{display:block;color:rgba(255,255,255,.8);text-decoration:none;margin-bottom:.5rem;transition:color .3s}
+.footer-section a:hover{color:var(--electric-teal)}
+.footer-bottom{border-top:1px solid rgba(255,255,255,.2);padding-top:2rem;text-align:center;color:rgba(255,255,255,.6);font-size:.9rem}
+.footer-logo{display:flex;align-items:center;gap:.5rem;margin-bottom:1rem}
+.footer-tagline{color:rgba(255,255,255,.8);font-size:.95rem;margin-bottom:1rem}
+</style>
+</head><body>
+${nav}
+<main class="contact-wrap">
+  <h1>Contact Us</h1>
+  <p class="contact-intro">Questions about your account, billing, or the scrubber? We typically respond within 1 business day.</p>
+  <div class="contact-email-row">&#x2709;&#xFE0F; Or email us directly: <a href="mailto:info@clinicosai.org">info@clinicosai.org</a></div>
+  <div class="contact-card">
+    ${confirmBanner}
+    ${errorBanner}
+    <form method="POST" action="/contact">
+      <div class="form-group">
+        <label for="contact_name">Name</label>
+        <input type="text" id="contact_name" name="name" required maxlength="200" placeholder="Your full name">
+      </div>
+      <div class="form-group">
+        <label for="contact_email">Email</label>
+        <input type="email" id="contact_email" name="email" required maxlength="200" placeholder="you@example.com">
+      </div>
+      <div class="form-group">
+        <label for="contact_subject">Subject</label>
+        <select id="contact_subject" name="subject" required>
+          <option value="" disabled selected>Select a subject…</option>
+          <option value="General Inquiry">General Inquiry</option>
+          <option value="Billing Question">Billing Question</option>
+          <option value="Technical Support">Technical Support</option>
+          <option value="Partnership">Partnership</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="contact_message">Message</label>
+        <textarea id="contact_message" name="message" required maxlength="5000" placeholder="How can we help?"></textarea>
+      </div>
+      <button type="submit" class="btn-submit">Send Message</button>
+    </form>
+  </div>
+</main>
+${FOOTER}
+</body></html>`;
+}
+
+app.get("/contact", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+  return c.html(contactPageHtml(nav, false, ""));
+});
+
+app.post("/contact", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+
+  let name = "", email = "", subject = "", message = "";
+  try {
+    const fd = await c.req.formData();
+    name = (fd.get("name") as string || "").trim();
+    email = (fd.get("email") as string || "").trim();
+    subject = (fd.get("subject") as string || "").trim();
+    message = (fd.get("message") as string || "").trim();
+  } catch {
+    return c.html(contactPageHtml(nav, false, "Could not read form data. Please try again."), 400);
+  }
+
+  if (!name || !email || !subject || !message) {
+    return c.html(contactPageHtml(nav, false, "Please fill in all fields."), 400);
+  }
+
+  const allowedSubjects = ["General Inquiry", "Billing Question", "Technical Support", "Partnership"];
+  if (!allowedSubjects.includes(subject)) {
+    return c.html(contactPageHtml(nav, false, "Invalid subject selection."), 400);
+  }
+
+  const notifBody = `New contact form submission from ClinicOS AI website\n\nName: ${name}\nEmail: ${email}\nSubject: ${subject}\n\nMessage:\n${message}`;
+
+  try {
+    const res = await fetch(
+      `${c.env.LAUNCHYARD_API_BASE_URL}/v1/public/companies/${c.env.COMPANY_ID}/founder-notifications`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${c.env.LAUNCHYARD_API_KEY}`,
+        },
+        body: JSON.stringify({
+          subject: `[Contact Form] ${subject} — from ${name}`,
+          body: notifBody,
+        }),
+      }
+    );
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("Contact form notification failed:", res.status, errText);
+      return c.html(contactPageHtml(nav, false, "We couldn't send your message right now. Please email us directly at info@clinicosai.org."), 500);
+    }
+  } catch (err) {
+    console.error("Contact form fetch error:", err);
+    return c.html(contactPageHtml(nav, false, "We couldn't send your message right now. Please email us directly at info@clinicosai.org."), 500);
+  }
+
+  return c.html(contactPageHtml(nav, true, ""));
+});
+
+app.get("/blog", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+
+  const articles = [
+    {
+      slug: "co4-denial-code",
+      title: "What Is a CO-4 Denial Code and How Do You Fix It?",
+      date: "June 10, 2026",
+      readTime: "5 min read",
+      excerpt: "A CO-4 denial means your claim was rejected because the modifier doesn't match the service billed. Learn what causes it, how to correct the claim, and how to prevent it from happening again with the right workflows."
+    },
+    {
+      slug: "how-to-reduce-claim-denials",
+      title: "How to Reduce Claim Denials: A Practical Guide for Independent Clinics",
+      date: "June 11, 2026",
+      readTime: "7 min read",
+      excerpt: "Well-run practices keep their denial rate under 5\u201310%, while the industry average sits at 15\u201320%. Here's a step-by-step playbook covering the top five denial causes and a biller checklist to hit those numbers."
+    },
+    {
+      slug: "medicare-claim-scrubber",
+      title: "Medicare Claim Scrubber: What to Look For Before You Submit",
+      date: "June 12, 2026",
+      readTime: "6 min read",
+      excerpt: "Medicare has stricter rules than commercial payers \u2014 MUE limits, LCD/NCD requirements, mandatory modifiers, and more. Here's exactly what to check before you hit submit to avoid the most common Medicare-specific denials."
+    },
+  ];
+
+  const cards = articles.map(a => `
+    <a class="blog-card" href="/blog/${a.slug}">
+      <div class="blog-card-meta"><span>${a.date}</span><span>${a.readTime}</span></div>
+      <h2>${a.title}</h2>
+      <p>${a.excerpt}</p>
+      <span class="blog-card-cta">Read article &rarr;</span>
+    </a>`).join("");
+
+  const content = `
+    <div class="blog-hero">
+      <h1>The ClinicOS AI Blog</h1>
+      <p>Practical guides on medical billing, claim denials, and revenue cycle management for independent clinics.</p>
+    </div>
+    <div class="blog-grid">${cards}</div>`;
+
+  return c.html(blogPage("Medical Billing Blog | ClinicOS AI", {
+    description: "Practical guides on medical billing, claim denials, modifiers, and revenue cycle management for independent clinics.",
+    canonical: "https://clinicosal.launchyard.app/blog"
+  }, content, nav));
+});
+
+app.get("/blog/co4-denial-code", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+
+  const content = `
+    <div class="article-hero">
+      <div class="breadcrumb"><a href="/blog">&larr; Blog</a></div>
+      <h1>What Is a CO-4 Denial Code and How Do You Fix It?</h1>
+      <div class="article-meta">
+        <span>June 10, 2026</span>
+        <span>5 min read</span>
+        <span>Medical Billing</span>
+      </div>
+    </div>
+    <div class="article-body">
+      <h2>What Does CO-4 Mean?</h2>
+      <p>When you receive a CO-4 denial, the payer is telling you that the <strong>modifier submitted on the claim is inconsistent with the procedure or service billed</strong>. The full ANSI reason code reads: "The service/procedure/equipment is not covered by the plan." In practice, CO-4 almost always means one of two things: either the modifier is missing when one is required, or the modifier that was used doesn't match what the payer expects for that CPT code on that claim type.</p>
+      <p>Both Medicare and commercial payers issue CO-4 denials, though Medicare is particularly strict because its National Correct Coding Initiative (NCCI) edits define exact modifier rules for every CPT code. When your claim breaks one of those rules, CO-4 is the result &mdash; and payment stops until you fix it.</p>
+      <p>Understanding CO-4 at the root level matters because it's one of the most preventable denial types. Unlike CO-50 (medical necessity denials that require clinical documentation), CO-4 is a pure coding issue. Get the modifier right, and you get paid.</p>
+
+      <h2>Common Causes of CO-4 Denials</h2>
+      <p>Most CO-4 denials trace back to one of four scenarios:</p>
+      <ol>
+        <li><strong>Missing modifier:</strong> A CPT code that requires a modifier was submitted without one. For example, billing an evaluation and management (E/M) service on the same day as a procedure without the -25 modifier, or billing bilateral procedures without -50.</li>
+        <li><strong>Wrong modifier:</strong> A modifier was appended but it's not the correct one for that CPT code. A common example is using -59 (distinct procedural service) when the payer requires -XU, -XS, -XE, or -XP (the "X" modifier subset introduced by Medicare in 2015).</li>
+        <li><strong>Modifier not supported for that CPT code:</strong> Some modifiers are only valid on specific code categories. Appending a surgical modifier to an E/M code, or using an anesthesia modifier on a non-anesthesia service, will trigger CO-4 from most payers.</li>
+        <li><strong>Modifier used on the wrong claim type:</strong> Certain modifiers are facility-specific or professional-claim-specific. A modifier valid on a UB-04 institutional claim may not be valid on a CMS-1500 professional claim, and vice versa.</li>
+      </ol>
+      <p>There's also a less obvious cause: <strong>outdated modifier reference materials</strong>. Payers update their modifier requirements periodically, and a modifier combination that was correct last year may now trigger a CO-4 under a new fee schedule or payer policy update.</p>
+
+      <h2>How to Fix a CO-4 Denial</h2>
+      <p>Fixing a CO-4 denial is a four-step process:</p>
+      <ol>
+        <li><strong>Identify the specific CPT code that was flagged.</strong> The remittance advice (RA) or explanation of benefits (EOB) will list the denied line item. Note the CPT code, the modifier(s) that were used, and the date of service.</li>
+        <li><strong>Pull the payer's modifier requirements for that CPT.</strong> Check the payer's online portal, the current NCCI edits table (for Medicare), or your billing system's modifier validation rules. Confirm whether a modifier is required, which modifier is correct, and whether any modifier is prohibited for that code combination.</li>
+        <li><strong>Correct the claim.</strong> If the modifier was missing, add the correct one. If the wrong modifier was used, replace it. If the modifier shouldn't have been there at all, remove it. Then resubmit the corrected claim within the payer's timely filing window &mdash; typically 90 to 365 days from the original date of service, depending on the contract.</li>
+        <li><strong>Appeal if the modifier was correct.</strong> If you believe the original modifier was accurate and the payer denied it in error, submit a written appeal with documentation: the relevant payer policy, the NCCI edit table reference, or the clinical notes supporting the modifier. Include the original remittance advice and the corrected claim.</li>
+      </ol>
+      <p>One important note: if the timely filing deadline has already passed, check whether you can appeal for a timely filing exception based on the initial claim being denied (not because you didn't submit on time, but because it was rejected). Many payers allow exceptions when the denial itself caused the delay.</p>
+
+      <h2>How to Prevent CO-4 Denials Going Forward</h2>
+      <p>The best CO-4 fix is the one you never have to make. Here are the most effective prevention strategies for independent clinics:</p>
+      <ul>
+        <li><strong>Use a claim scrubber before every submission.</strong> A real-time claim scrubber validates modifier requirements against NCCI edits and payer-specific rules before the claim leaves your system. It catches the modifier issues that billers miss under time pressure.</li>
+        <li><strong>Build a payer-specific modifier reference sheet.</strong> Each of your top payers may have slightly different modifier requirements for your most-billed CPT codes. A one-page cheat sheet per payer &mdash; reviewed and updated every quarter &mdash; reduces the cognitive load on billers and cuts CO-4 rates significantly.</li>
+        <li><strong>Train billers on the top CPT/modifier combinations that trigger CO-4.</strong> In most practices, a handful of CPT codes account for the majority of CO-4 denials: E/M with -25, bilateral procedures with -50, distinct procedures with -59/-XU/-XS, and global surgery modifiers (-54, -55, -56). Deep familiarity with these ten or so combinations covers the majority of CO-4 exposure.</li>
+        <li><strong>Audit CO-4 denials monthly.</strong> Track which CPT codes and which payers are generating CO-4 denials, and look for patterns. A biller consistently missing -25 on E/M same-day visits, or a payer that switched modifier requirements after a contract update, will surface quickly in a monthly review.</li>
+        <li><strong>Verify modifier requirements when adding new CPT codes to your charge master.</strong> Every time you start billing a new service, check the modifier requirements before the first claim goes out &mdash; not after the first denial comes back.</li>
+      </ul>
+
+      <div class="article-cta">
+        <h3>Catch CO-4 Errors Before Submission</h3>
+        <p>ClinicOS AI scrubs every claim against NCCI edits and payer-specific modifier rules in real time &mdash; so CO-4 denials get caught before they become rework.</p>
+        <a href="/signup" class="cta-btn">Try ClinicOS AI Free &rarr;</a>
+      </div>
+    </div>`;
+
+  return c.html(blogPage("CO-4 Denial Code: What It Means and How to Fix It | ClinicOS AI", {
+    description: "A CO-4 denial means your claim was rejected for an incorrect modifier. Learn what causes it, how to fix it, and how to prevent it from happening again.",
+    canonical: "https://clinicosal.launchyard.app/blog/co4-denial-code"
+  }, content, nav));
+});
+
+app.get("/blog/how-to-reduce-claim-denials", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+
+  const content = `
+    <div class="article-hero">
+      <div class="breadcrumb"><a href="/blog">&larr; Blog</a></div>
+      <h1>How to Reduce Claim Denials: A Practical Guide for Independent Clinics</h1>
+      <div class="article-meta">
+        <span>June 11, 2026</span>
+        <span>7 min read</span>
+        <span>Revenue Cycle Management</span>
+      </div>
+    </div>
+    <div class="article-body">
+      <p>If your practice is seeing a 15&ndash;20% denial rate, you're not unusual &mdash; that's roughly the industry average for independent clinics. But you are leaving significant money on the table. Well-run practices consistently keep their denial rates under 5&ndash;10%, and the gap between those two numbers has a direct dollar value: with an average cost of <strong>$25 to rework a single denied claim</strong>, and research showing that <strong>65% of denied claims are never resubmitted at all</strong>, a high denial rate isn't just an administrative headache. It's a revenue leak.</p>
+      <p>The good news: the causes of most claim denials are well understood, and the fixes are operational, not clinical. You don't need new software or a bigger billing team. You need better processes applied consistently.</p>
+
+      <h2>What's a Good Denial Rate?</h2>
+      <p>Industry benchmarks vary by specialty, payer mix, and patient volume, but the widely cited targets are:</p>
+      <ul>
+        <li><strong>Under 5%:</strong> Excellent. Your revenue cycle is well-optimized.</li>
+        <li><strong>5&ndash;10%:</strong> Good. Room to improve, but you're above average.</li>
+        <li><strong>10&ndash;15%:</strong> Average. You're losing meaningful revenue to rework and write-offs.</li>
+        <li><strong>Above 15%:</strong> High. This should be a priority operational issue, not a background concern.</li>
+      </ul>
+      <p>The Healthcare Financial Management Association (HFMA) reports that the average first-pass claim acceptance rate is around 85%. That means 15 out of every 100 claims sent to a payer come back denied or rejected before payment. For a practice billing $50,000/month, that's up to $7,500 in claims entering a rework queue &mdash; and $4,875 that statistically never get resubmitted.</p>
+      <p>The goal of reducing your denial rate isn't perfection &mdash; it's moving the needle from average to good, because each percentage point of improvement translates directly to recovered revenue.</p>
+
+      <h2>The Top 5 Causes of Claim Denials</h2>
+      <p>While every practice's denial mix is different, these five causes account for the vast majority of denials across specialties and payer types:</p>
+      <ol>
+        <li><strong>Missing or incorrect patient information.</strong> Eligibility denials happen when the patient's name, date of birth, insurance ID, or group number on the claim doesn't match what the payer has on file. These are entirely preventable &mdash; but only if you verify eligibility before the visit, not after.</li>
+        <li><strong>Authorization not obtained.</strong> Many procedures and imaging services require prior authorization. If the auth wasn't obtained before the service, or if the auth was obtained for a different CPT code than what was billed, the claim will deny. The frustrating part: auth denials are often non-appealable, meaning the revenue is simply lost.</li>
+        <li><strong>Coding errors.</strong> Wrong CPT codes, wrong modifiers, unbundled services that should be billed together, or diagnoses that don't support the billed procedure &mdash; coding errors are the single largest category of avoidable denials. They're also the hardest to catch manually at scale, which is why claim scrubbers exist.</li>
+        <li><strong>Timely filing limits missed.</strong> Every payer has a deadline for initial claim submission, typically 90 days to 12 months from the date of service. Claims submitted after the deadline are denied with no path to appeal (or a very narrow one). These denials represent pure write-offs.</li>
+        <li><strong>Duplicate claim submission.</strong> Submitting the same claim twice &mdash; whether due to a billing system error, a manual re-submission that didn't account for the first submission still pending, or a workaround gone wrong &mdash; results in the second claim being denied as a duplicate. Unlike most other denial types, duplicates are the payer doing exactly what they should, which means your process needs to change.</li>
+      </ol>
+
+      <h2>A Practical Checklist for Billers</h2>
+      <p>The following checklist, applied consistently, addresses all five of the top denial causes. It's designed for independent clinics where one or two billers handle the full revenue cycle:</p>
+      <ul class="checklist">
+        <li>Verify insurance eligibility for every patient before the visit &mdash; not at check-in, but 24&ndash;48 hours ahead of time so issues can be resolved.</li>
+        <li>Confirm prior authorization requirements for all scheduled procedures that require one. Document the auth number, the authorized CPT codes, and the authorization expiration date in the patient chart.</li>
+        <li>Scrub every claim before submission &mdash; use a rules-based scrubber that validates against NCCI edits, payer-specific modifier requirements, and diagnosis-procedure compatibility.</li>
+        <li>Track denial reasons by payer and by code. A monthly denial log takes 30 minutes to maintain and surfaces the patterns that drive 80% of your denial volume.</li>
+        <li>Follow up on every denial within 7 business days of receipt. After 30 days, your appeal options narrow and your collection probability drops sharply.</li>
+        <li>Check timely filing deadlines for every payer in your mix and set calendar reminders at the 60-day and 90-day marks from date of service for any unresolved claims.</li>
+        <li>When resubmitting a corrected claim, flag it as a corrected claim (not a new submission) using the appropriate bill type or frequency code to avoid a duplicate denial.</li>
+      </ul>
+
+      <h2>How to Track and Benchmark Your Denial Rate</h2>
+      <p>You can't manage what you don't measure. Here's a simple framework for tracking your denial rate without a dedicated analytics tool:</p>
+      <p><strong>Your denial rate formula:</strong> Total denied claim lines &divide; Total submitted claim lines in a given period &times; 100. Run this monthly using data from your practice management system or clearinghouse portal.</p>
+      <p>Break it down by payer. A 20% overall denial rate might be driven almost entirely by one payer with a systemic authorization problem, while your other payers are at 5%. Knowing that lets you direct your attention where it matters.</p>
+      <p>Also track your <strong>first-pass acceptance rate</strong> (claims paid on first submission with no correction), your <strong>average days in accounts receivable (DAR)</strong>, and your <strong>write-off rate</strong> (claims that were denied and never collected). Together, these four metrics give you a complete picture of your revenue cycle health.</p>
+
+      <h2>The Bottom Line</h2>
+      <p>Reducing claim denials is not a one-time project &mdash; it's an ongoing operational discipline. The practices that maintain sub-10% denial rates do three things consistently: they verify eligibility before every visit, they scrub every claim before submission, and they follow up on every denial within a week.</p>
+      <p>The technology to do this well &mdash; real-time eligibility checks, AI-powered claim scrubbers, denial tracking dashboards &mdash; is no longer just for large health systems. It's available for independent clinics at a fraction of the cost it used to be. The question isn't whether you can afford to implement these workflows. It's whether you can afford not to.</p>
+
+      <div class="article-cta">
+        <h3>See Your Denial Rate vs. Industry Average</h3>
+        <p>ClinicOS AI tracks your denial rate by payer, by code, and over time &mdash; so you always know where you stand and what to fix first.</p>
+        <a href="/signup" class="cta-btn">Start Your Free Trial &rarr;</a>
+      </div>
+    </div>`;
+
+  return c.html(blogPage("How to Reduce Claim Denials: A Practical Guide for Independent Clinics | ClinicOS AI", {
+    description: "The average clinic has a 15-20% denial rate. Well-run practices keep it under 5-10%. Here's exactly how they do it — and how you can too.",
+    canonical: "https://clinicosal.launchyard.app/blog/how-to-reduce-claim-denials"
+  }, content, nav));
+});
+
+app.get("/blog/medicare-claim-scrubber", async (c) => {
+  const db = c.env.DB;
+  const sessionId = parseCookies(c.req.header("Cookie") || "")["session"];
+  const user = sessionId ? await getSession(db, sessionId) : null;
+  const nav = buildNav(user);
+
+  const content = `
+    <div class="article-hero">
+      <div class="breadcrumb"><a href="/blog">&larr; Blog</a></div>
+      <h1>Medicare Claim Scrubber: What to Look For Before You Submit</h1>
+      <div class="article-meta">
+        <span>June 12, 2026</span>
+        <span>6 min read</span>
+        <span>Medicare Billing</span>
+      </div>
+    </div>
+    <div class="article-body">
+      <p>Medicare claims aren't like commercial claims. The rules are more numerous, more specific, and more strictly enforced &mdash; and the consequences of getting them wrong go beyond a simple denial. Medicare's higher audit rates mean that systematic billing errors can trigger a Targeted Probe and Educate (TPE) review or, in serious cases, a Recovery Audit Contractor (RAC) audit. A good claim scrubber catches most of these issues before they become problems. But most scrubbers aren't optimized for Medicare's unique requirements.</p>
+      <p>Here's exactly what to check before submitting a Medicare claim.</p>
+
+      <h2>Why Medicare Claims Get Denied More Often</h2>
+      <p>Medicare operates under a set of rules that commercial payers largely don't enforce at the same level of granularity. The Centers for Medicare &amp; Medicaid Services (CMS) publishes the NCCI (National Correct Coding Initiative) edits, MUE (Medically Unlikely Edit) tables, Local Coverage Determinations (LCDs), and National Coverage Determinations (NCDs) &mdash; and Medicare's Fiscal Intermediaries and Medicare Administrative Contractors (MACs) enforce all of them.</p>
+      <p>Commercial payers may use a subset of NCCI edits, but they rarely enforce MUE limits as strictly, and most don't have the equivalent of LCD/NCD requirements. When a biller moves between Medicare and commercial claims without adjusting their checklist, Medicare-specific denials follow.</p>
+      <p>Medicare also has unique enrollment requirements for ordering and referring providers, place-of-service rules, and quality reporting obligations &mdash; all of which can trigger a denial even when the CPT code and diagnosis are correct.</p>
+
+      <h2>Medically Unlikely Edits (MUEs): The Hidden Trap</h2>
+      <p>MUEs are CMS-defined limits on the maximum units of service (UOS) that a provider can bill for a single CPT code on a single date of service for a single beneficiary. They exist to flag claims where the quantity billed is medically implausible &mdash; for example, billing 10 units of a procedure that can only reasonably be performed once or twice.</p>
+      <p>MUE limits are published in the CMS MUE table, available on the CMS website, and updated quarterly. The limits vary widely by code:</p>
+      <ul>
+        <li>CPT 99213 (established patient office visit, moderate complexity): MUE of 1 &mdash; you can only bill one E/M visit per day per beneficiary.</li>
+        <li>CPT 36415 (routine venipuncture): MUE of 1 &mdash; one draw per encounter.</li>
+        <li>CPT 97110 (therapeutic exercise): MUE of 4 &mdash; meaning you can bill up to 4 units per session, but billing 5 will trigger an edit.</li>
+        <li>CPT 11042 (debridement, subcutaneous tissue): MUE of 3.</li>
+      </ul>
+      <p>The most common MUE trap is in physical therapy and chiropractic claims, where billers sometimes enter the number of body areas treated rather than the number of 15-minute units. A claim for 8 units of 97110 when the MUE is 4 will deny on the excess units. Check the CMS MUE table for every CPT code on your high-volume list and build those limits into your scrubbing rules.</p>
+      <p>To look up current MUE limits: go to CMS.gov, search for "MUE values," and download the current HCPCS Code MUE table. It's a spreadsheet with the MUE adjudication indicator (MAI) for each code &mdash; MAI of 3 means the limit is a date-of-service edit that applies per claim line.</p>
+
+      <h2>Modifier Requirements Unique to Medicare</h2>
+      <p>Medicare uses modifiers differently than commercial payers in several important ways. These four are the most commonly missed:</p>
+      <ul>
+        <li><strong>Modifier -25 (Significant, separately identifiable E/M service):</strong> Required when billing an E/M service on the same day as a procedure with a global period (even a 0-day global). Without -25, Medicare bundles the E/M into the procedure payment and denies it. This is one of the most frequent CO-4 triggers on Medicare claims.</li>
+        <li><strong>Modifier -59 (Distinct procedural service):</strong> Used to override NCCI bundling edits when services that are normally bundled were genuinely distinct. However, Medicare prefers the more specific "X" modifiers introduced in 2015: -XE (separate encounter), -XS (separate structure), -XP (separate practitioner), -XU (unusual non-overlapping service). Using -59 when a specific X modifier is more appropriate can still be flagged on audit.</li>
+        <li><strong>Modifier -GA (Waiver of liability statement issued):</strong> Required when a service is expected to be denied as not medically necessary and the provider has a signed Advance Beneficiary Notice (ABN) on file. Without -GA, if Medicare denies the claim, the beneficiary cannot be billed. With -GA, you can collect from the patient if Medicare denies.</li>
+        <li><strong>Modifier -KX (Requirements specified in the medical policy have been met):</strong> Required for certain DME and therapy services to attest that the medical necessity criteria in the relevant LCD are met. Missing -KX on a service that requires it results in an automatic denial &mdash; no documentation review, no appeal path until you resubmit with the modifier.</li>
+      </ul>
+
+      <h2>LCD and NCD Flags</h2>
+      <p>Local Coverage Determinations (LCDs) are coverage rules issued by Medicare Administrative Contractors (MACs) for their geographic jurisdiction. National Coverage Determinations (NCDs) are coverage rules issued by CMS nationally. Both define which diagnoses support coverage for specific procedures.</p>
+      <p>If you bill a CPT code without a diagnosis that appears on the LCD/NCD's list of covered ICD-10 codes, Medicare will deny the claim as not medically necessary &mdash; even if the procedure itself was clinically appropriate. The denial won't mention the LCD by name; it will simply come back as CO-50 or CO-167.</p>
+      <p>How to check before you submit:</p>
+      <ol>
+        <li>Go to the CMS LCD/NCD search tool at cms.gov or your MAC's website.</li>
+        <li>Search for the CPT code you're billing.</li>
+        <li>Confirm that at least one of the diagnosis codes on the claim is listed as a covered indication in the relevant LCD or NCD.</li>
+        <li>If the ICD-10 code is on the LCD's "non-covered" list, and you have an ABN, append -GY (item or service is statutorily excluded or does not meet the definition of any benefit). If there is no ABN and the service is non-covered, you generally cannot bill the patient either.</li>
+      </ol>
+      <p>The most important LCDs to have memorized for your specialty are those covering your most frequently billed services. For a primary care practice, that might include the LCD for diabetes self-management training, routine foot care, or advance care planning. For a physical therapy practice, it's the musculoskeletal LCDs that define diagnosis requirements for therapeutic procedures.</p>
+
+      <h2>Common Medicare Claim Errors to Catch Before Submission</h2>
+      <p>Beyond MUEs, modifiers, and LCDs, these errors account for a significant share of Medicare denials and are all catchable at the scrubbing stage:</p>
+      <ul>
+        <li><strong>Place of service mismatch:</strong> The place of service (POS) code on the claim must match where the service was actually rendered. Billing POS 11 (office) for a service performed in a hospital outpatient department (POS 22) &mdash; even accidentally &mdash; results in a denial and potential audit exposure. Check the POS code against the service location on every claim.</li>
+        <li><strong>Missing referring provider NPI:</strong> Medicare requires the ordering/referring provider's NPI on claims for diagnostic imaging, lab, and other ordered services. If the NPI field is blank or populated with the rendering provider's NPI instead of the ordering provider's, the claim will deny.</li>
+        <li><strong>Ordering/referring provider not enrolled in Medicare:</strong> Even if the NPI is present, the ordering provider must be enrolled in Medicare (not just have an NPI). If the provider who ordered the service is not enrolled in Medicare's PECOS system, the claim will deny. This is a common issue when services are ordered by a provider who recently joined the practice or who practices in another state.</li>
+        <li><strong>Duplicate claim or service:</strong> Medicare's system is sensitive to duplicates. If a claim for the same beneficiary, date of service, CPT code, and provider is already on file (even in pending status), the second submission will deny as a duplicate. Before resubmitting any claim, confirm the original is truly absent from the payer's system &mdash; don't assume it was lost just because you haven't received payment.</li>
+        <li><strong>Rendering provider not linked to billing provider:</strong> For group practices, the rendering provider NPI must be properly linked to the billing entity NPI in PECOS. If the link is missing or the reassignment agreement isn't on file, Medicare will deny the claim.</li>
+      </ul>
+
+      <div class="article-cta">
+        <h3>ClinicOS AI Checks All of This Automatically</h3>
+        <p>Our Medicare-aware claim scrubber validates MUE limits, modifier requirements, LCD/NCD coverage, and provider enrollment issues before you submit &mdash; catching the errors that cost clinics the most.</p>
+        <a href="/signup" class="cta-btn">Try It Free &rarr;</a>
+      </div>
+    </div>`;
+
+  return c.html(blogPage("Medicare Claim Scrubber: What to Check Before You Submit | ClinicOS AI", {
+    description: "Medicare claims have unique rules most scrubbers miss. Here's what to check for MUE limits, modifier requirements, LCD/NCD flags, and common Medicare-specific errors before you submit.",
+    canonical: "https://clinicosal.launchyard.app/blog/medicare-claim-scrubber"
+  }, content, nav));
+});
+
+// ─── End Blog ──────────────────────────────────────────────────────────────────
+
 app.get("/sitemap.xml", (c) => c.body(
-  `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://clinicosal.launchyard.app/</loc></url><url><loc>https://clinicosal.launchyard.app/pricing</loc></url><url><loc>https://clinicosal.launchyard.app/scrubber</loc></url><url><loc>https://clinicosal.launchyard.app/appeal-generator</loc></url><url><loc>https://clinicosal.launchyard.app/denial-tracker</loc></url><url><loc>https://clinicosal.launchyard.app/eligibility</loc></url><url><loc>https://clinicosal.launchyard.app/appeals</loc></url><url><loc>https://clinicosal.launchyard.app/signup</loc></url><url><loc>https://clinicosal.launchyard.app/login</loc></url></urlset>`,
+  `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://clinicosal.launchyard.app/</loc></url><url><loc>https://clinicosal.launchyard.app/pricing</loc></url><url><loc>https://clinicosal.launchyard.app/scrubber</loc></url><url><loc>https://clinicosal.launchyard.app/appeal-generator</loc></url><url><loc>https://clinicosal.launchyard.app/denial-tracker</loc></url><url><loc>https://clinicosal.launchyard.app/eligibility</loc></url><url><loc>https://clinicosal.launchyard.app/appeals</loc></url><url><loc>https://clinicosal.launchyard.app/signup</loc></url><url><loc>https://clinicosal.launchyard.app/login</loc></url><url><loc>https://clinicosal.launchyard.app/terms</loc></url><url><loc>https://clinicosal.launchyard.app/privacy</loc></url><url><loc>https://clinicosal.launchyard.app/baa</loc></url><url><loc>https://clinicosal.launchyard.app/blog</loc></url><url><loc>https://clinicosal.launchyard.app/blog/co4-denial-code</loc></url><url><loc>https://clinicosal.launchyard.app/blog/how-to-reduce-claim-denials</loc></url><url><loc>https://clinicosal.launchyard.app/blog/medicare-claim-scrubber</loc></url><url><loc>https://clinicosal.launchyard.app/contact</loc></url></urlset>`,
   200, { "Content-Type": "application/xml" }
 ));
 app.get("/robots.txt", (c) => c.text("User-agent: *\nAllow: /\nSitemap: https://clinicosal.launchyard.app/sitemap.xml"));
@@ -6506,9 +8276,267 @@ ClinicOS AI Team`;
   }
 }
 
+// ─── Paid-account helper ─────────────────────────────────────────────────────
+// Returns users on active paid plans (Starter, Growth, Professional) — not trial/free.
+const PAID_PLANS = ['starter', 'growth', 'professional', 'pro'];
+
+// ─── Alert 1: Appeal Overdue Alert (runs daily) ───────────────────────────────
+async function runAppealOverdueAlerts(env: Bindings): Promise<void> {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Find paid users who have at least one open appeal
+  const paidUsers = await env.DB.prepare(`
+    SELECT DISTINCT u.id, u.email, u.name FROM users u
+    WHERE u.plan IN (${PAID_PLANS.map(() => '?').join(',')})
+    AND EXISTS (
+      SELECT 1 FROM appeals_tracker at
+      WHERE at.user_id = u.id AND at.status = 'Sent'
+    )
+  `).bind(...PAID_PLANS).all<{id: string; email: string; name: string | null}>();
+
+  for (const user of paidUsers.results) {
+    // Fetch all open "Sent" appeals for this user
+    const openAppeals = await env.DB.prepare(`
+      SELECT id, denial_code, payer, billed_amount, date_sent
+      FROM appeals_tracker
+      WHERE user_id = ? AND status = 'Sent'
+      ORDER BY date_sent ASC
+    `).bind(user.id).all<{id: string; denial_code: string; payer: string; billed_amount: number; date_sent: string}>();
+
+    if (!openAppeals.results.length) continue;
+
+    const now = new Date();
+
+    // Bucket appeals by alert tier
+    const due30: typeof openAppeals.results = [];
+    const due60: typeof openAppeals.results = [];
+
+    for (const appeal of openAppeals.results) {
+      // date_sent is stored as ISO date string (YYYY-MM-DD)
+      const sentTs = Math.floor(new Date(appeal.date_sent).getTime() / 1000);
+      const ageSeconds = nowSec - sentTs;
+      if (ageSeconds >= 60 * 86400) {
+        due60.push(appeal);
+      } else if (ageSeconds >= 30 * 86400) {
+        due30.push(appeal);
+      }
+    }
+
+    // For each tier, check alert log to avoid duplicates
+    for (const [tier, appeals] of [['60day', due60], ['30day', due30]] as [string, typeof due60][]) {
+      if (!appeals.length) continue;
+
+      // Filter to only those not yet alerted for this tier
+      const unsentAppeals: typeof appeals = [];
+      for (const appeal of appeals) {
+        const already = await env.DB.prepare(
+          `SELECT id FROM appeal_alert_log WHERE appeal_id = ? AND alert_type = ?`
+        ).bind(appeal.id, tier).first();
+        if (!already) unsentAppeals.push(appeal);
+      }
+
+      if (!unsentAppeals.length) continue;
+
+      const displayName = user.name || user.email.split('@')[0];
+      const count = unsentAppeals.length;
+      const alertLabel = tier === '30day' ? '30' : '60';
+
+      const appealLines = unsentAppeals.map(a => {
+        const sentDate = new Date(a.date_sent);
+        const daysOut = Math.floor((now.getTime() - sentDate.getTime()) / 86400000);
+        return `• Denial Code: ${a.denial_code} | Payer: ${a.payer} | Billed: $${a.billed_amount.toFixed(2)} | Days Outstanding: ${daysOut}`;
+      }).join('\n');
+
+      const emailBody = `Hi ${displayName},
+
+You have ${count} appeal${count === 1 ? '' : 's'} that ${count === 1 ? 'has' : 'have'} been open for ${alertLabel}+ days with no status update.
+
+${appealLines}
+
+Following up on overdue appeals is one of the highest-ROI tasks in medical billing. Appeals older than 30 days are at serious risk of being closed without payment.
+
+Log in to review and follow up on your open appeals:
+https://clinicosal.launchyard.app/appeals
+
+Best,
+ClinicOS AI Team
+
+---
+You are receiving this alert because you have an active paid plan on ClinicOS AI. To stop these alerts, reply UNSUBSCRIBE.`;
+
+      try {
+        const res = await fetch(
+          `${env.LAUNCHYARD_API_BASE_URL}/v1/public/companies/${env.COMPANY_ID}/emails`,
+          {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'Authorization': `Bearer ${env.LAUNCHYARD_API_KEY}`},
+            body: JSON.stringify({
+              to: user.email,
+              subject: `You have ${count} appeal${count === 1 ? '' : 's'} open for ${alertLabel}+ days — follow up now`,
+              body: emailBody,
+              message_scope: 'transactional',
+            }),
+          }
+        );
+        if (!res.ok) {
+          console.error(`Appeal alert email failed for user ${user.id}: ${res.status}`);
+          continue;
+        }
+
+        // Log each alert to prevent duplicates
+        for (const appeal of unsentAppeals) {
+          const logId = generateId();
+          await env.DB.prepare(
+            `INSERT OR IGNORE INTO appeal_alert_log (id, appeal_id, user_id, alert_type) VALUES (?, ?, ?, ?)`
+          ).bind(logId, appeal.id, user.id, tier).run();
+        }
+      } catch (err) {
+        console.error(`Appeal overdue alert error for user ${user.id}:`, err);
+      }
+    }
+  }
+}
+
+// ─── Alert 2: Denial Rate Spike Alert (runs on 1st of each month) ────────────
+async function runDenialRateSpikeAlerts(env: Bindings): Promise<void> {
+  const now = new Date();
+  // Current month = the month we're in now; compare it to previous month
+  // "This month" = last complete calendar month (prev month when running on 1st)
+  // "Last month" = the month before that
+  const thisMonthYear = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+  const thisMonth = now.getMonth() === 0 ? 12 : now.getMonth(); // getMonth() 0-indexed
+  const lastMonthYear = thisMonth === 1 ? thisMonthYear - 1 : thisMonthYear;
+  const lastMonth = thisMonth === 1 ? 12 : thisMonth - 1;
+
+  const thisStart = new Date(thisMonthYear, thisMonth - 1, 1);
+  const thisEnd = new Date(thisMonthYear, thisMonth, 1);
+  const lastStart = new Date(lastMonthYear, lastMonth - 1, 1);
+  const lastEnd = new Date(lastMonthYear, lastMonth, 1);
+  const toUnix = (d: Date) => Math.floor(d.getTime() / 1000);
+
+  // Paid users who have claims this month AND last month
+  const paidUsers = await env.DB.prepare(`
+    SELECT DISTINCT u.id, u.email, u.name FROM users u
+    WHERE u.plan IN (${PAID_PLANS.map(() => '?').join(',')})
+    AND EXISTS (SELECT 1 FROM denials d WHERE d.user_id = u.id AND d.created_at >= ? AND d.created_at < ?)
+    AND EXISTS (SELECT 1 FROM denials d WHERE d.user_id = u.id AND d.created_at >= ? AND d.created_at < ?)
+  `).bind(...PAID_PLANS, toUnix(thisStart), toUnix(thisEnd), toUnix(lastStart), toUnix(lastEnd))
+    .all<{id: string; email: string; name: string | null}>();
+
+  for (const user of paidUsers.results) {
+    try {
+      // Get claim counts for denial rate calculation — use claim_reports count as total claims
+      const [thisClaimsRow, lastClaimsRow] = await Promise.all([
+        env.DB.prepare(`SELECT COUNT(*) as cnt FROM claim_reports WHERE user_id = ? AND created_at >= ? AND created_at < ?`)
+          .bind(user.id, toUnix(thisStart), toUnix(thisEnd)).first<{cnt: number}>(),
+        env.DB.prepare(`SELECT COUNT(*) as cnt FROM claim_reports WHERE user_id = ? AND created_at >= ? AND created_at < ?`)
+          .bind(user.id, toUnix(lastStart), toUnix(lastEnd)).first<{cnt: number}>(),
+      ]);
+
+      const [thisDenialsRow, lastDenialsRow] = await Promise.all([
+        env.DB.prepare(`SELECT COUNT(*) as cnt FROM denials WHERE user_id = ? AND created_at >= ? AND created_at < ?`)
+          .bind(user.id, toUnix(thisStart), toUnix(thisEnd)).first<{cnt: number}>(),
+        env.DB.prepare(`SELECT COUNT(*) as cnt FROM denials WHERE user_id = ? AND created_at >= ? AND created_at < ?`)
+          .bind(user.id, toUnix(lastStart), toUnix(lastEnd)).first<{cnt: number}>(),
+      ]);
+
+      const thisTotal = thisClaimsRow?.cnt ?? 0;
+      const lastTotal = lastClaimsRow?.cnt ?? 0;
+      const thisDenials = thisDenialsRow?.cnt ?? 0;
+      const lastDenials = lastDenialsRow?.cnt ?? 0;
+
+      if (thisTotal === 0 || lastTotal === 0) continue;
+
+      const thisRate = (thisDenials / thisTotal) * 100;
+      const lastRate = (lastDenials / lastTotal) * 100;
+      const spike = thisRate - lastRate;
+
+      if (spike <= 5) continue; // No significant spike
+
+      // Find the top denial code that increased the most
+      const thisCodes = await env.DB.prepare(`
+        SELECT denial_reason_code, denial_reason_label, COUNT(*) as cnt
+        FROM denials WHERE user_id = ? AND created_at >= ? AND created_at < ?
+        GROUP BY denial_reason_code, denial_reason_label
+      `).bind(user.id, toUnix(thisStart), toUnix(thisEnd))
+        .all<{denial_reason_code: string; denial_reason_label: string; cnt: number}>();
+
+      const lastCodeMap: Record<string, number> = {};
+      const lastCodes = await env.DB.prepare(`
+        SELECT denial_reason_code, COUNT(*) as cnt
+        FROM denials WHERE user_id = ? AND created_at >= ? AND created_at < ?
+        GROUP BY denial_reason_code
+      `).bind(user.id, toUnix(lastStart), toUnix(lastEnd))
+        .all<{denial_reason_code: string; cnt: number}>();
+      for (const row of lastCodes.results) {
+        lastCodeMap[row.denial_reason_code] = row.cnt;
+      }
+
+      let topDriver = '';
+      let topIncrease = 0;
+      for (const row of thisCodes.results) {
+        const prev = lastCodeMap[row.denial_reason_code] ?? 0;
+        const increase = row.cnt - prev;
+        if (increase > topIncrease) {
+          topIncrease = increase;
+          topDriver = `${row.denial_reason_code} — ${row.denial_reason_label} (+${increase} additional denial${increase === 1 ? '' : 's'})`;
+        }
+      }
+
+      const MONTH_NAMES_LOCAL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+      const thisMonthName = MONTH_NAMES_LOCAL[thisMonth - 1];
+      const lastMonthName = MONTH_NAMES_LOCAL[lastMonth - 1];
+      const displayName = user.name || user.email.split('@')[0];
+
+      const emailBody = `Hi ${displayName},
+
+Your denial rate increased from ${lastRate.toFixed(1)}% in ${lastMonthName} to ${thisRate.toFixed(1)}% in ${thisMonthName} — a ${spike.toFixed(1)} percentage point increase.
+
+Top denial driver: ${topDriver || 'Multiple denial codes increased this month.'}
+
+A sudden spike in your denial rate often signals a change in payer rules, a coder error affecting multiple claims, or a new coverage issue for a specific patient population. Reviewing this early can prevent further revenue loss.
+
+Log in to your Denial Tracker to investigate:
+https://clinicosal.launchyard.app/denial-tracker
+
+Best,
+ClinicOS AI Team
+
+---
+You are receiving this alert because you have an active paid plan on ClinicOS AI. To stop these alerts, reply UNSUBSCRIBE.`;
+
+      await fetch(
+        `${env.LAUNCHYARD_API_BASE_URL}/v1/public/companies/${env.COMPANY_ID}/emails`,
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'Authorization': `Bearer ${env.LAUNCHYARD_API_KEY}`},
+          body: JSON.stringify({
+            to: user.email,
+            subject: `Your denial rate increased from ${lastRate.toFixed(1)}% to ${thisRate.toFixed(1)}% this month`,
+            body: emailBody,
+            message_scope: 'transactional',
+          }),
+        }
+      );
+    } catch (err) {
+      console.error(`Denial rate spike alert error for user ${user.id}:`, err);
+    }
+  }
+}
+
 export default {
   fetch: app.fetch,
-  async scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runMonthlyCron(env));
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
+    const now = new Date();
+    const dayOfMonth = now.getUTCDate();
+
+    // Monthly cron (0 8 1 * *): billing health reports + denial rate spike alerts
+    if (dayOfMonth === 1) {
+      ctx.waitUntil(runMonthlyCron(env));
+      ctx.waitUntil(runDenialRateSpikeAlerts(env));
+    }
+
+    // Daily cron (0 9 * * *): appeal overdue alerts
+    ctx.waitUntil(runAppealOverdueAlerts(env));
   },
 };

@@ -8,7 +8,7 @@
     "db": "required",
     "object_storage": "required",
     "frontier_ai": "required",
-    "cron": {"schedules": ["0 8 1 * *"]}
+    "cron": {"schedules": ["0 8 1 * *", "0 9 * * *"]}
   },
   "requested_env": [
     "APP_BASE_URL",
